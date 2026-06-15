@@ -1,0 +1,75 @@
+# HeyMarket Backend
+
+Python **FastAPI** service implementing all 63 REST endpoints consumed by the HeyMarket React Native frontend.
+
+**Location:** `HeyMarketApp/Backend` (sibling to `Frontend/`)
+
+## Quick start
+
+```bash
+cd Backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+API base: `http://localhost:8000/v1`  
+Interactive docs: `http://localhost:8000/docs`
+
+## Frontend connection
+
+In `Frontend/.env`:
+
+```
+EXPO_PUBLIC_API_URL=http://localhost:8000/v1
+EXPO_PUBLIC_API_MOCK_FALLBACK=false
+```
+
+## Demo account
+
+| Field | Value |
+|-------|-------|
+| Phone | `0400000000` |
+| Password | `demo123` |
+
+## API documentation
+
+See `../Documents/backend-api/`:
+
+| Document | Content |
+|----------|---------|
+| [API-000_Overview.md](../Documents/backend-api/API-000_Overview.md) | Conventions, auth, pagination |
+| [API-MASTER_Reference.md](../Documents/backend-api/API-MASTER_Reference.md) | All 63 endpoints |
+| API-001 … API-008 | Domain-specific schemas and behavior |
+
+## Architecture
+
+```
+app/
+├── main.py           # FastAPI app, CORS, error handlers
+├── config.py         # Environment settings
+├── database.py       # SQLAlchemy engine + session
+├── models.py         # ORM models
+├── schemas.py        # Pydantic DTOs (mirror frontend types.ts)
+├── serializers.py    # Model → DTO mappers
+├── auth.py           # JWT + password hashing
+├── seed.py           # Demo listings, users, coupons
+└── routers/          # Route handlers by domain
+```
+
+**Database:** SQLite by default (`heishi.db`). Set `DATABASE_URL` for PostgreSQL in production.
+
+**Uploads:** Stored in `uploads/` and served at `/uploads/{key}`.
+
+## Endpoint coverage
+
+All endpoints from `Frontend/src/api/endpoints/*` are implemented:
+
+- Auth (5), Catalog (6), Listings + Upload (7), Orders (7)
+- Favorites, History, Follows, Coupons (10)
+- Messaging + Notifications (5)
+- Profile, Payments, Payouts, Settings (18)
+- Regions, Safety (5)
+
+**Total: 63 endpoints**

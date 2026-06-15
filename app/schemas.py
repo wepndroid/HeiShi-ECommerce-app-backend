@@ -1,0 +1,349 @@
+from datetime import datetime
+from typing import Generic, Literal, TypeVar
+
+from pydantic import BaseModel, Field
+
+T = TypeVar("T")
+
+
+class ApiErrorBody(BaseModel):
+    code: str | None = None
+    message: str
+    details: dict | None = None
+
+
+class Paginated(BaseModel, Generic[T]):
+    items: list[T]
+    page: int
+    pageSize: int
+    total: int
+    hasMore: bool
+
+
+# Auth
+class RegisterRequest(BaseModel):
+    nickname: str = Field(min_length=1, max_length=50)
+    phone: str
+    password: str = Field(min_length=6)
+
+
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    refreshToken: str
+
+
+class AuthUserDto(BaseModel):
+    id: str
+    nickname: str
+    phone: str
+    avatarUrl: str | None = None
+    bio: str | None = None
+    city: str | None = None
+    language: Literal["en", "zh"] | None = None
+    heishiId: str
+
+
+class AuthTokensDto(BaseModel):
+    accessToken: str
+    refreshToken: str
+    expiresIn: int
+    user: AuthUserDto
+
+
+# Catalog
+class SellerDto(BaseModel):
+    id: str
+    nickname: str
+    avatarUrl: str | None = None
+    verified: bool | None = None
+
+
+class ListingSummaryDto(BaseModel):
+    id: int
+    type: Literal["product", "service", "bundle"]
+    title: str
+    description: str | None = None
+    price: float
+    currency: Literal["AUD"] = "AUD"
+    categoryKey: str
+    tagKey: str
+    locationLabel: str
+    imageUrl: str
+    seller: SellerDto
+    status: Literal["active", "draft", "sold", "inactive"]
+    createdAt: str
+
+
+class ListingDetailDto(ListingSummaryDto):
+    images: list[str]
+    conditionKey: str | None = None
+    negotiable: bool | None = None
+    escrowSupported: bool | None = None
+    pickupMethods: list[str] | None = None
+    viewCount: int | None = None
+    favoriteCount: int | None = None
+
+
+class LocalServiceDto(BaseModel):
+    id: int
+    title: str
+    description: str
+    priceFrom: float
+    currency: Literal["AUD"] = "AUD"
+    area: str
+    icon: Literal["truck", "broom", "cameraService"]
+    seller: SellerDto
+
+
+class SuggestionDto(BaseModel):
+    query: str
+    listingId: int
+    title: str
+    subtitle: str
+
+
+# Listings
+class CreateListingRequest(BaseModel):
+    type: Literal["product", "service"]
+    title: str
+    description: str
+    price: float
+    categoryKey: str
+    conditionKey: str | None = None
+    tagKey: str | None = None
+    locationLabel: str
+    imageUrls: list[str]
+    pickupMethods: list[str] | None = None
+
+
+class UploadImageResponse(BaseModel):
+    url: str
+    key: str
+
+
+# Orders
+class CreateOrderRequest(BaseModel):
+    listingId: int
+    deliveryMethod: str
+    paymentMethodId: str | None = None
+
+
+class OrderDto(BaseModel):
+    id: int
+    listingId: int
+    listingTitle: str
+    listingImageUrl: str
+    seller: SellerDto
+    status: Literal["pendingPay", "pendingShip", "pendingReceive", "pendingReview", "completed", "cancelled"]
+    amount: float
+    escrowFee: float
+    currency: Literal["AUD"] = "AUD"
+    createdAt: str
+    updatedAt: str
+
+
+class ReviewRequest(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = None
+
+
+# User library
+class FavoriteDto(BaseModel):
+    listingId: int
+    createdAt: str
+
+
+class ViewHistoryItemDto(BaseModel):
+    listingId: int
+    viewedAt: str
+
+
+class FollowDto(BaseModel):
+    userId: str
+    nickname: str
+    subtitle: str | None = None
+    followedAt: str
+
+
+class CouponDto(BaseModel):
+    id: str
+    amount: float
+    currency: Literal["AUD"] = "AUD"
+    description: str
+    expiresAt: str | None = None
+    status: Literal["available", "used", "expired"]
+
+
+# Messaging
+class CounterpartDto(BaseModel):
+    id: str
+    nickname: str
+    avatarUrl: str | None = None
+
+
+class ListingRefDto(BaseModel):
+    id: int
+    title: str
+    imageUrl: str | None = None
+
+
+class LastMessageDto(BaseModel):
+    text: str
+    sentAt: str
+
+
+class ConversationDto(BaseModel):
+    id: str
+    counterpart: CounterpartDto
+    listing: ListingRefDto | None = None
+    lastMessage: LastMessageDto | None = None
+    unreadCount: int
+
+
+class ChatMessageDto(BaseModel):
+    id: str
+    conversationId: str
+    senderId: str
+    text: str
+    sentAt: str
+
+
+class OpenConversationRequest(BaseModel):
+    listingId: int
+    counterpartUserId: str | None = None
+
+
+class SendMessageRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class SystemNotificationDto(BaseModel):
+    id: str
+    title: str
+    body: str
+    createdAt: str
+    unread: bool | None = None
+
+
+# User profile
+class UserProfileUpdateRequest(BaseModel):
+    nickname: str | None = None
+    bio: str | None = None
+    city: str | None = None
+    language: Literal["en", "zh"] | None = None
+    avatarUrl: str | None = None
+
+
+class AddressDto(BaseModel):
+    id: str
+    label: str
+    area: str
+    meetupSpot: str | None = None
+    isDefault: bool | None = None
+
+
+class AddressCreateRequest(BaseModel):
+    label: str
+    area: str
+    meetupSpot: str | None = None
+    isDefault: bool | None = None
+
+
+class CreditProfileDto(BaseModel):
+    score: int
+    trades: int
+    completionRate: float
+    violations: int
+    rating: float
+
+
+class ReviewSummaryDto(BaseModel):
+    score: float
+    pendingCount: int
+
+
+class VerificationStatusDto(BaseModel):
+    phoneVerified: bool
+    wechatBound: bool
+    alipayBound: bool
+    identityVerified: bool
+    businessVerified: bool
+
+
+class PaymentMethodDto(BaseModel):
+    id: str
+    type: Literal["card", "apple_pay", "paypal"]
+    label: str
+    last4: str | None = None
+    isDefault: bool | None = None
+
+
+class AddPaymentMethodRequest(BaseModel):
+    type: Literal["card", "apple_pay", "paypal"]
+    token: str
+
+
+class PayoutMethodDto(BaseModel):
+    id: str
+    type: Literal["bank", "paypal"]
+    label: str
+    last4: str | None = None
+    isDefault: bool | None = None
+
+
+class AddPayoutMethodRequest(BaseModel):
+    type: Literal["bank", "paypal"]
+    accountToken: str
+
+
+class NotificationSettingsDto(BaseModel):
+    intentAlerts: bool
+    chatMessages: bool
+    reviewResults: bool
+    marketing: bool
+
+
+class PrivacySettingsDto(BaseModel):
+    findByPhone: bool
+    showWechatBadge: bool
+    personalization: bool
+
+
+class CacheClearResponse(BaseModel):
+    freedBytes: int
+
+
+# Region & safety
+class RegionCityDto(BaseModel):
+    name: str
+    cn: str
+    areas: list[str]
+
+
+class RegionDto(BaseModel):
+    state: str
+    stateName: str
+    cities: list[RegionCityDto]
+
+
+class ReportSummaryDto(BaseModel):
+    id: str
+    targetType: str
+    status: str
+    createdAt: str
+
+
+class SubmitReportRequest(BaseModel):
+    targetType: Literal["listing", "user"]
+    targetId: str
+    reason: str
+    details: str | None = None
+
+
+class BlocklistUserDto(BaseModel):
+    userId: str
+    nickname: str
