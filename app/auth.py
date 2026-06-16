@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import re
 import secrets
+import uuid
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,10 +17,22 @@ from app.models import RefreshToken, User
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
 security = HTTPBearer(auto_error=False)
+AU_PHONE_RE = re.compile(r"^(\+?61|0)\d{8,10}$")
 
 
 def normalize_phone(phone: str) -> str:
     return re.sub(r"\s+", "", phone.strip())
+
+
+def is_valid_au_phone(phone: str) -> bool:
+    return bool(AU_PHONE_RE.match(normalize_phone(phone)))
+
+
+def generate_heishi_id(db: Session, phone: str) -> str:
+    base = f"HS{phone[-8:]}"
+    if not db.query(User).filter(User.heishi_id == base).first():
+        return base
+    return f"{base}{uuid.uuid4().hex[:4].upper()}"
 
 
 def hash_password(password: str) -> str:

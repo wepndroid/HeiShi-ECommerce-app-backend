@@ -4,8 +4,10 @@ from sqlalchemy.orm import Session
 from app.auth import (
     create_access_token,
     create_refresh_token,
+    generate_heishi_id,
     get_current_user,
     hash_password,
+    is_valid_au_phone,
     normalize_phone,
     revoke_user_refresh_tokens,
     store_refresh_token,
@@ -22,6 +24,20 @@ from app.serializers import user_to_dto
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _validation_error(message: str = "Invalid phone format") -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"code": "VALIDATION_ERROR", "message": message, "details": {}},
+    )
+
+
+def _require_valid_phone(raw_phone: str) -> str:
+    phone = normalize_phone(raw_phone)
+    if not is_valid_au_phone(phone):
+        raise _validation_error()
+    return phone
+
+
 def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
     access = create_access_token(user.id)
     refresh = create_refresh_token()
@@ -36,13 +52,13 @@ def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
 
 @router.post("/register", response_model=AuthTokensDto, status_code=201)
 def register(body: RegisterRequest, db: Session = Depends(get_db)):
-    phone = normalize_phone(body.phone)
+    phone = _require_valid_phone(body.phone)
     if db.query(User).filter(User.phone == phone).first():
         raise HTTPException(
             status_code=409,
             detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
         )
-    heishi_id = f"HS{phone[-8:]}"
+    heishi_id = generate_heishi_id(db, phone)
     user = User(
         nickname=body.nickname.strip(),
         phone=phone,
@@ -59,7 +75,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
 
 @router.post("/login", response_model=AuthTokensDto)
 def login(body: LoginRequest, db: Session = Depends(get_db)):
-    phone = normalize_phone(body.phone)
+    phone = _require_valid_phone(body.phone)
     user = db.query(User).filter(User.phone == phone).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(
