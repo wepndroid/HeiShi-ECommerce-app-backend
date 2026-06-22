@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-in-production"
     jwt_access_expire_seconds: int = 3600
     jwt_refresh_expire_days: int = 30
-    base_url: str = "http://localhost:8000"
+    base_url: str = "http://127.0.0.1:8000"
     cors_origins: str = "*"
     upload_dir: str = "uploads"
     escrow_fee: float = 0.99

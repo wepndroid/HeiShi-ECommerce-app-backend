@@ -86,6 +86,33 @@ class ListingDetailDto(ListingSummaryDto):
     pickupMethods: list[str] | None = None
     viewCount: int | None = None
     favoriteCount: int | None = None
+    bundleMeta: dict | None = None
+
+
+class BundleItemRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    sharePrice: float = Field(gt=0)
+    separatePrice: float | None = Field(default=None, gt=0)
+    imageUrl: str | None = None
+    imageUrls: list[str] | None = None
+
+
+# Listings
+class CreateListingRequest(BaseModel):
+    type: Literal["product", "service", "bundle"]
+    title: str
+    description: str
+    price: float
+    categoryKey: str
+    conditionKey: str | None = None
+    tagKey: str | None = None
+    locationLabel: str
+    imageUrls: list[str]
+    pickupMethods: list[str] | None = None
+    bundleItems: list[BundleItemRequest] | None = None
+    pickupDeadline: str | None = None
+    allowSeparateSale: bool | None = True
+    pickupWindow: str | None = None
 
 
 class LocalServiceDto(BaseModel):
@@ -96,6 +123,7 @@ class LocalServiceDto(BaseModel):
     currency: Literal["AUD"] = "AUD"
     area: str
     icon: Literal["truck", "broom", "cameraService"]
+    imageUrl: str | None = None
     seller: SellerDto
 
 
@@ -106,18 +134,15 @@ class SuggestionDto(BaseModel):
     subtitle: str
 
 
-# Listings
-class CreateListingRequest(BaseModel):
-    type: Literal["product", "service"]
-    title: str
-    description: str
-    price: float
-    categoryKey: str
-    conditionKey: str | None = None
-    tagKey: str | None = None
-    locationLabel: str
-    imageUrls: list[str]
-    pickupMethods: list[str] | None = None
+class ImageSearchResponseDto(BaseModel):
+    suggestedQuery: str
+    matchCount: int
+    items: list[ListingSummaryDto]
+    page: int
+    pageSize: int
+    total: int
+    hasMore: bool
+
 
 
 class UploadImageResponse(BaseModel):
@@ -189,6 +214,9 @@ class ListingRefDto(BaseModel):
     id: int
     title: str
     imageUrl: str | None = None
+    price: float | None = None
+    locationLabel: str | None = None
+    currency: Literal["AUD"] = "AUD"
 
 
 class LastMessageDto(BaseModel):
@@ -227,6 +255,28 @@ class SystemNotificationDto(BaseModel):
     body: str
     createdAt: str
     unread: bool | None = None
+
+
+NotificationCategory = Literal["system", "order", "follow"]
+
+
+class InboxNotificationDto(BaseModel):
+    id: str
+    category: NotificationCategory
+    title: str
+    body: str
+    createdAt: str
+    unread: bool
+    actionType: str | None = None
+    actionRef: str | None = None
+
+
+class NotificationGroupDto(BaseModel):
+    category: NotificationCategory
+    unreadCount: int
+    previewTitle: str
+    previewBody: str
+    lastAt: str | None = None
 
 
 # User profile
@@ -272,6 +322,26 @@ class VerificationStatusDto(BaseModel):
     alipayBound: bool
     identityVerified: bool
     businessVerified: bool
+
+
+class PublicUserProfileDto(BaseModel):
+    """Public seller profile — no phone, payment, or address data."""
+
+    id: str
+    nickname: str
+    avatarUrl: str | None = None
+    bio: str | None = None
+    city: str | None = None
+    memberSince: str
+    rating: float
+    reviewCount: int
+    listingCount: int
+    followerCount: int
+    phoneVerified: bool
+    identityVerified: bool
+    businessVerified: bool
+    wechatLinked: bool
+    alipayLinked: bool
 
 
 class PaymentMethodDto(BaseModel):
@@ -347,3 +417,19 @@ class SubmitReportRequest(BaseModel):
 class BlocklistUserDto(BaseModel):
     userId: str
     nickname: str
+
+
+class FormOptionDto(BaseModel):
+    key: str
+    labelEn: str
+    labelZh: str
+
+
+class ListingFormOptionsDto(BaseModel):
+    categories: list[FormOptionDto]
+    conditions: list[FormOptionDto]
+    pickupMethods: list[FormOptionDto]
+    deliveryMethods: list[FormOptionDto]
+    serviceTypes: list[FormOptionDto]
+    serviceAreas: list[FormOptionDto]
+    serviceTimeSlots: list[FormOptionDto]

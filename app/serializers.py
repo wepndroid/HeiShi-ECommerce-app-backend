@@ -1,14 +1,17 @@
 from datetime import datetime, timezone
 
+from app.avatar_photos import avatar_url_for_user_id
 from app.models import (
     Address,
     Conversation,
     Coupon,
+    Follow,
     Listing,
     Message,
     Order,
     PaymentMethod,
     PayoutMethod,
+    Review,
     SystemNotification,
     User,
     UserSettings,
@@ -33,9 +36,12 @@ from app.schemas import (
     PaymentMethodDto,
     PayoutMethodDto,
     PrivacySettingsDto,
+    PublicUserProfileDto,
     ReviewSummaryDto,
     SellerDto,
     SystemNotificationDto,
+    InboxNotificationDto,
+    NotificationGroupDto,
     VerificationStatusDto,
 )
 
@@ -48,13 +54,17 @@ def iso(dt: datetime | None) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def _user_avatar_url(user: User) -> str | None:
+    return user.avatar_url or avatar_url_for_user_id(user.id)
+
+
 def user_to_dto(user: User) -> AuthUserDto:
     lang = user.language if user.language in ("en", "zh") else "en"
     return AuthUserDto(
         id=user.id,
         nickname=user.nickname,
         phone=user.phone,
-        avatarUrl=user.avatar_url,
+        avatarUrl=_user_avatar_url(user),
         bio=user.bio,
         city=user.city,
         language=lang,
@@ -62,13 +72,64 @@ def user_to_dto(user: User) -> AuthUserDto:
     )
 
 
-def seller_to_dto(user: User) -> SellerDto:
+def public_user_profile(
+    user: User,
+    *,
+    rating: float,
+    review_count: int,
+    listing_count: int,
+    follower_count: int,
+    settings: UserSettings | None,
+    lang: str = "en",
+) -> PublicUserProfileDto:
+    nickname = user.nickname
+    if lang == "zh":
+        nickname = _SELLER_NICKNAME_ZH.get(user.id, nickname)
+    show_wechat = settings.show_wechat_badge if settings else False
+    return PublicUserProfileDto(
+        id=user.id,
+        nickname=nickname,
+        avatarUrl=_user_avatar_url(user),
+        bio=user.bio,
+        city=user.city,
+        memberSince=iso(user.created_at),
+        rating=round(rating, 1),
+        reviewCount=review_count,
+        listingCount=listing_count,
+        followerCount=follower_count,
+        phoneVerified=user.phone_verified,
+        identityVerified=user.identity_verified,
+        businessVerified=user.business_verified,
+        wechatLinked=bool(user.wechat_bound and show_wechat),
+        alipayLinked=user.alipay_bound,
+    )
+
+
+def seller_to_dto(user: User, lang: str = "en") -> SellerDto:
+    nickname = user.nickname
+    if lang == "zh":
+        nickname = _SELLER_NICKNAME_ZH.get(user.id, nickname)
     return SellerDto(
         id=user.id,
-        nickname=user.nickname,
-        avatarUrl=user.avatar_url,
+        nickname=nickname,
+        avatarUrl=_user_avatar_url(user),
         verified=user.identity_verified or user.business_verified,
     )
+
+
+_SELLER_NICKNAME_ZH: dict[str, str] = {
+    "seller-mia": "Mia_墨尔本",
+    "seller-sunny": "阳光卖家",
+    "seller-lucas": "Lucas_墨尔本",
+    "seller-xiaoyu": "小雨同学",
+    "seller-amy": "艾米",
+    "seller-ticketShop": "票券小铺",
+    "seller-pte": "PTE学长",
+    "seller-luna": "露娜",
+    "seller-coffee": "咖啡不加糖",
+    "seller-allen": "艾伦",
+    "seller-lily": "莉莉",
+}
 
 
 def listing_title(listing: Listing, lang: str = "en") -> str:
@@ -95,7 +156,7 @@ def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
         tagKey=listing.tag_key,
         locationLabel=listing.location_label,
         imageUrl=listing.image_url,
-        seller=seller_to_dto(listing.seller),
+        seller=seller_to_dto(listing.seller, lang),
         status=status,
         createdAt=iso(listing.created_at),
     )
@@ -103,6 +164,7 @@ def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
 
 def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
     summary = listing_to_summary(listing, lang)
+    bundle_meta = listing.bundle_meta if listing.type == "bundle" and listing.bundle_meta else None
     return ListingDetailDto(
         **summary.model_dump(),
         images=listing.images,
@@ -112,6 +174,7 @@ def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
         pickupMethods=listing.pickup_methods,
         viewCount=listing.view_count,
         favoriteCount=listing.favorite_count,
+        bundleMeta=bundle_meta if bundle_meta else None,
     )
 
 
@@ -124,7 +187,8 @@ def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
         priceFrom=listing.price,
         area=listing.location_label,
         icon=icon,
-        seller=seller_to_dto(listing.seller),
+        imageUrl=listing.image_url,
+        seller=seller_to_dto(listing.seller, lang),
     )
 
 
@@ -137,7 +201,7 @@ def order_to_dto(order: Order, lang: str = "en") -> OrderDto:
         listingId=order.listing_id,
         listingTitle=listing_title(order.listing, lang),
         listingImageUrl=order.listing.image_url,
-        seller=seller_to_dto(order.seller),
+        seller=seller_to_dto(order.seller, lang),
         status=status,
         amount=order.amount,
         escrowFee=order.escrow_fee,
@@ -170,7 +234,7 @@ def coupon_to_dto(coupon: Coupon) -> CouponDto:
     )
 
 
-def conversation_to_dto(conv: Conversation, current_user_id: str) -> ConversationDto:
+def conversation_to_dto(conv: Conversation, current_user_id: str, lang: str = "en") -> ConversationDto:
     is_buyer = conv.buyer_id == current_user_id
     counterpart_user = conv.seller if is_buyer else conv.buyer
     unread = conv.buyer_unread if is_buyer else conv.seller_unread
@@ -179,15 +243,17 @@ def conversation_to_dto(conv: Conversation, current_user_id: str) -> Conversatio
         last_msg = LastMessageDto(text=conv.last_message_text, sentAt=iso(conv.last_message_at))
     listing_ref = ListingRefDto(
         id=conv.listing.id,
-        title=conv.listing.title,
+        title=listing_title(conv.listing, lang),
         imageUrl=conv.listing.image_url,
+        price=conv.listing.price,
+        locationLabel=conv.listing.location_label,
     )
     return ConversationDto(
         id=conv.id,
         counterpart=CounterpartDto(
             id=counterpart_user.id,
             nickname=counterpart_user.nickname,
-            avatarUrl=counterpart_user.avatar_url,
+            avatarUrl=_user_avatar_url(counterpart_user),
         ),
         listing=listing_ref,
         lastMessage=last_msg,
@@ -273,4 +339,43 @@ def system_notification_to_dto(n: SystemNotification) -> SystemNotificationDto:
         body=n.body,
         createdAt=iso(n.created_at),
         unread=n.unread,
+    )
+
+
+def inbox_notification_to_dto(n: SystemNotification, lang: str = "en") -> InboxNotificationDto:
+    title = n.title_zh if lang == "zh" and n.title_zh else n.title
+    body = n.body_zh if lang == "zh" and n.body_zh else n.body
+    category = n.category if n.category in ("system", "order", "follow") else "system"
+    return InboxNotificationDto(
+        id=n.id,
+        category=category,
+        title=title,
+        body=body,
+        createdAt=iso(n.created_at),
+        unread=bool(n.unread),
+        actionType=n.action_type,
+        actionRef=n.action_ref,
+    )
+
+
+def notification_group_to_dto(
+    category: str,
+    unread_count: int,
+    latest: SystemNotification | None,
+    lang: str = "en",
+) -> NotificationGroupDto:
+    if latest:
+        preview_title = latest.title_zh if lang == "zh" and latest.title_zh else latest.title
+        preview_body = latest.body_zh if lang == "zh" and latest.body_zh else latest.body
+        last_at = iso(latest.created_at)
+    else:
+        preview_title = ""
+        preview_body = ""
+        last_at = None
+    return NotificationGroupDto(
+        category=category if category in ("system", "order", "follow") else "system",
+        unreadCount=unread_count,
+        previewTitle=preview_title,
+        previewBody=preview_body,
+        lastAt=last_at,
     )

@@ -1,12 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from app.auth import get_current_user
+from app.auth import get_accept_language, get_current_user
 from app.catalog_helpers import get_or_create_settings
 from app.database import get_db
-from app.models import Address, Order, PaymentMethod, PayoutMethod, Review, User
+from app.models import Address, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings
 from app.schemas import (
     AddPaymentMethodRequest,
     AddPayoutMethodRequest,
@@ -18,22 +18,31 @@ from app.schemas import (
     NotificationSettingsDto,
     PaymentMethodDto,
     PayoutMethodDto,
+    ListingSummaryDto,
+    Paginated,
     PrivacySettingsDto,
+    PublicUserProfileDto,
     ReviewSummaryDto,
     UserProfileUpdateRequest,
     VerificationStatusDto,
 )
+from app.pagination import paginate
+from app.routers.region_safety import REGION_DATA
 from app.serializers import (
     address_to_dto,
     credit_profile,
+    listing_to_summary,
     payment_to_dto,
     payout_to_dto,
+    public_user_profile,
     review_summary,
     settings_to_notification,
     settings_to_privacy,
     user_to_dto,
     verification_to_dto,
 )
+
+KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
 
 
 class NotificationSettingsUpdate(BaseModel):
@@ -54,6 +63,65 @@ payouts_router = APIRouter(prefix="/payouts", tags=["payouts"])
 settings_router = APIRouter(prefix="/settings", tags=["settings"])
 
 
+@router.get("/users/{user_id}/profile", response_model=PublicUserProfileDto)
+def get_public_profile(user_id: str, request: Request, db: Session = Depends(get_db)):
+    lang = get_accept_language(request)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "User not found", "details": {}},
+        )
+    review_row = (
+        db.query(func.avg(Review.rating), func.count(Review.id))
+        .join(Order, Review.order_id == Order.id)
+        .filter(Order.seller_id == user.id)
+        .one()
+    )
+    avg_rating = float(review_row[0] or 5.0)
+    review_count = int(review_row[1] or 0)
+    listing_count = (
+        db.query(Listing).filter(Listing.seller_id == user.id, Listing.status == "active").count()
+    )
+    follower_count = db.query(Follow).filter(Follow.followed_id == user.id).count()
+    settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+    return public_user_profile(
+        user,
+        rating=avg_rating,
+        review_count=review_count,
+        listing_count=listing_count,
+        follower_count=follower_count,
+        settings=settings,
+        lang=lang,
+    )
+
+
+@router.get("/users/{user_id}/listings", response_model=Paginated[ListingSummaryDto])
+def get_public_listings(
+    user_id: str,
+    request: Request,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "User not found", "details": {}},
+        )
+    q = (
+        db.query(Listing)
+        .options(joinedload(Listing.seller))
+        .filter(Listing.seller_id == user.id, Listing.status == "active")
+        .order_by(Listing.created_at.desc())
+    )
+    total = q.count()
+    items = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+
+
 @router.get("/users/me/profile", response_model=AuthUserDto)
 def get_profile(user: User = Depends(get_current_user)):
     return user_to_dto(user)
@@ -66,7 +134,10 @@ def update_profile(body: UserProfileUpdateRequest, user: User = Depends(get_curr
     if body.bio is not None:
         user.bio = body.bio
     if body.city is not None:
-        user.city = body.city
+        city = body.city.strip()
+        if city not in KNOWN_CITY_NAMES:
+            raise HTTPException(status_code=400, detail="Invalid city")
+        user.city = city
     if body.language is not None:
         user.language = body.language
     if body.avatarUrl is not None:

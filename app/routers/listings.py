@@ -13,10 +13,78 @@ from app.pagination import paginate
 from app.schemas import CreateListingRequest, ListingSummaryDto, Paginated, UploadImageResponse
 from app.serializers import listing_to_summary
 
+
+def _build_bundle_meta(body: CreateListingRequest) -> dict:
+    items = body.bundleItems or []
+    share_total = round(sum(item.sharePrice for item in items), 2)
+    if len(items) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "VALIDATION_ERROR", "message": "Bundle requires at least 2 items", "details": {}},
+        )
+    if abs(share_total - round(body.price, 2)) > 0.02:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": "Bundle item shares must add up to the bundle price",
+                "details": {"shareTotal": share_total, "price": body.price},
+            },
+        )
+    return {
+        "fullPrice": body.price,
+        "pickupDeadline": body.pickupDeadline,
+        "allowSeparateSale": body.allowSeparateSale if body.allowSeparateSale is not None else True,
+        "pickupWindow": body.pickupWindow,
+        "totalItems": len(items),
+        "items": [
+            {
+                "id": str(uuid.uuid4()),
+                "title": item.title,
+                "sharePrice": item.sharePrice,
+                "separatePrice": item.separatePrice,
+                "imageUrls": item.imageUrls or ([item.imageUrl] if item.imageUrl else []),
+                "imageUrl": (item.imageUrls[0] if item.imageUrls else item.imageUrl),
+                "status": "available",
+            }
+            for item in items
+        ],
+    }
+
 router = APIRouter(tags=["listings"])
 upload_router = APIRouter(prefix="/uploads", tags=["uploads"])
 
-ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+ALLOWED_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
+
+_EXT_TO_TYPE = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _resolve_upload_content_type(file: UploadFile) -> str | None:
+    content_type = (file.content_type or "").lower()
+    if content_type in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}:
+        return "image/jpeg" if content_type == "image/jpg" else content_type
+
+    ext = Path(file.filename or "photo.jpg").suffix.lower()
+    mapped = _EXT_TO_TYPE.get(ext)
+    if mapped and content_type in {"application/octet-stream", "binary/octet-stream", "", "image/jpg"}:
+        return mapped
+    if mapped and content_type.startswith("image/"):
+        return mapped
+    return None
 
 
 @router.get("/listings/mine", response_model=Paginated[ListingSummaryDto])
@@ -64,23 +132,35 @@ def create_listing(
 ):
     if not body.imageUrls:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "At least one image required", "details": {}})
+    listing_type = body.type
+    if listing_type == "bundle":
+        bundle_meta = _build_bundle_meta(body)
+        tag_key = body.tagKey or "bundleSet"
+        condition_key = body.conditionKey
+        status = "draft"
+    else:
+        bundle_meta = {}
+        tag_key = body.tagKey or ""
+        condition_key = body.conditionKey
+        status = "active"
     listing = Listing(
         seller_id=user.id,
-        type=body.type,
+        type=listing_type,
         title=body.title,
         description=body.description,
         price=body.price,
         category_key=body.categoryKey,
-        tag_key=body.tagKey or "",
-        condition_key=body.conditionKey,
+        tag_key=tag_key,
+        condition_key=condition_key,
         location_label=body.locationLabel,
         region_state="VIC",
         region_city="Melbourne",
         region_area=body.locationLabel,
-        status="active",
+        status=status,
     )
     listing.images = body.imageUrls
     listing.pickup_methods = body.pickupMethods or ["meetup"]
+    listing.bundle_meta = bundle_meta
     db.add(listing)
     db.commit()
     db.refresh(listing)
@@ -184,7 +264,8 @@ async def upload_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    if file.content_type not in ALLOWED_TYPES:
+    resolved_type = _resolve_upload_content_type(file)
+    if not resolved_type:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "Invalid file type", "details": {}})
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:

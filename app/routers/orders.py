@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session, joinedload
 
-from app.auth import get_current_user
+from app.auth import get_accept_language, get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models import Listing, Order, Review, User
@@ -16,12 +16,14 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 @router.get("", response_model=Paginated[OrderDto])
 def list_orders(
+    request: Request,
     status: str | None = None,
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    lang = get_accept_language(request)
     q = (
         db.query(Order)
         .options(joinedload(Order.listing), joinedload(Order.seller))
@@ -32,11 +34,11 @@ def list_orders(
     q = q.order_by(Order.created_at.desc())
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([order_to_dto(o) for o in items], page, pageSize, total)
+    return paginate([order_to_dto(o, lang) for o in items], page, pageSize, total)
 
 
 @router.get("/{order_id}", response_model=OrderDto)
-def get_order(order_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_order(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     order = (
         db.query(Order)
         .options(joinedload(Order.listing), joinedload(Order.seller))
@@ -45,12 +47,13 @@ def get_order(order_id: int, user: User = Depends(get_current_user), db: Session
     )
     if not order:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Order not found", "details": {}})
-    return order_to_dto(order)
+    return order_to_dto(order, get_accept_language(request))
 
 
 @router.post("", response_model=OrderDto, status_code=201)
 def create_order(
     body: CreateOrderRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -74,11 +77,11 @@ def create_order(
     db.refresh(order)
     order.listing = listing
     order.seller = listing.seller
-    return order_to_dto(order)
+    return order_to_dto(order, get_accept_language(request))
 
 
 @router.post("/{order_id}/pay", response_model=OrderDto)
-def pay_order(order_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def pay_order(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     order = _get_buyer_order(db, order_id, user.id)
     if order.status != "pendingPay":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending payment", "details": {}})
@@ -86,7 +89,7 @@ def pay_order(order_id: int, user: User = Depends(get_current_user), db: Session
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
-    return order_to_dto(order)
+    return order_to_dto(order, get_accept_language(request))
 
 
 @router.post("/{order_id}/remind-ship", status_code=204)
@@ -98,7 +101,7 @@ def remind_ship(order_id: int, user: User = Depends(get_current_user), db: Sessi
 
 
 @router.post("/{order_id}/confirm-receive", response_model=OrderDto)
-def confirm_receive(order_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def confirm_receive(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     order = _get_buyer_order(db, order_id, user.id)
     if order.status not in ("pendingShip", "pendingReceive"):
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending receive", "details": {}})
@@ -106,7 +109,7 @@ def confirm_receive(order_id: int, user: User = Depends(get_current_user), db: S
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
-    return order_to_dto(order)
+    return order_to_dto(order, get_accept_language(request))
 
 
 @router.post("/{order_id}/review", status_code=204)

@@ -87,6 +87,7 @@ class Listing(Base):
     negotiable: Mapped[bool] = mapped_column(Boolean, default=False)
     escrow_supported: Mapped[bool] = mapped_column(Boolean, default=True)
     pickup_methods_json: Mapped[str] = mapped_column(Text, default='["meetup"]')
+    bundle_meta_json: Mapped[str] = mapped_column(Text, default="{}")
     service_icon: Mapped[str | None] = mapped_column(String(30), nullable=True)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
     favorite_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -117,6 +118,18 @@ class Listing(Base):
     @pickup_methods.setter
     def pickup_methods(self, value: list[str]) -> None:
         self.pickup_methods_json = json.dumps(value)
+
+    @property
+    def bundle_meta(self) -> dict:
+        try:
+            parsed = json.loads(self.bundle_meta_json)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @bundle_meta.setter
+    def bundle_meta(self, value: dict) -> None:
+        self.bundle_meta_json = json.dumps(value)
 
 
 class Order(Base):
@@ -285,8 +298,13 @@ class SystemNotification(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    category: Mapped[str] = mapped_column(String(20), default="system", index=True)
     title: Mapped[str] = mapped_column(String(200))
+    title_zh: Mapped[str | None] = mapped_column(String(200), nullable=True)
     body: Mapped[str] = mapped_column(Text)
+    body_zh: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    action_ref: Mapped[str | None] = mapped_column(String(50), nullable=True)
     unread: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

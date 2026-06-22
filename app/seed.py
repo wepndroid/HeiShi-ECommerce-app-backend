@@ -5,6 +5,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.auth import hash_password, normalize_phone
+from app.avatar_photos import avatar_url_for_user_id
 from app.models import (
     Coupon,
     Listing,
@@ -15,18 +16,18 @@ from app.models import (
 )
 
 PRODUCTS = [
-    (1, "Edifier W820NB Noise-Cancelling Headphones", "漫步者 W820NB 降噪耳机", 89, "digital", "lightlyUsed", "Clayton", "mia", "Mia_墨尔本"),
-    (2, "SMEG Style Electric Kettle", "SMEG 风格电水壶", 129, "home", "brandNew", "Melbourne CBD", "sunny", "Sunny"),
-    (3, "Keychron K2 Mechanical Keyboard", "Keychron K2 机械键盘", 79, "digital", "likeNew95", "Carlton", "lucas", "Lucas_墨尔本"),
-    (4, "Fujifilm instax mini 40", "富士 instax mini 40 拍立得", 95, "digital", "withFilm", "Box Hill", "xiaoyu", "小雨同学"),
+    (1, "Edifier W820NB Noise-Cancelling Headphones", "漫步者降噪耳机", 89, "digital", "lightlyUsed", "Clayton", "mia", "Mia_墨尔本"),
+    (2, "SMEG Style Electric Kettle", "思美格风格电水壶", 129, "home", "brandNew", "Melbourne CBD", "sunny", "Sunny"),
+    (3, "Keychron K2 Mechanical Keyboard", "K2 机械键盘", 79, "digital", "likeNew95", "Carlton", "lucas", "Lucas_墨尔本"),
+    (4, "Fujifilm instax mini 40", "富士 mini 40 拍立得", 95, "digital", "withFilm", "Box Hill", "xiaoyu", "小雨同学"),
     (5, "Nordic Folding Desk", "北欧折叠书桌", 45, "home", "foldable", "Burwood", "amy", "Amy"),
     (6, "Melbourne Concert Ticket", "墨尔本演唱会门票", 68, "tickets", "lowPriceTransfer", "Southbank", "ticketShop", "票券小铺"),
     (7, "PTE Speaking Coaching 1-on-1", "PTE口语陪练 1v1", 30, "services", "localService", "Online", "pte", "PTE学长"),
     (8, "Ukulele Starter Kit", "尤克里里初学套装", 55, "misc", "fullAccessories", "Docklands", "luna", "Luna"),
     (9, "Used Bicycle Helmet", "二手自行车头盔", 25, "misc", "safetyGear", "Richmond", "coffee", "咖啡不加糖"),
-    (10, "Dyson Supersonic Hair Dryer", "Dyson Supersonic 吹风机", 299, "home", "lightlyUsed", "Glen Waverley", "sunny", "Sunny"),
+    (10, "Dyson Supersonic Hair Dryer", "戴森吹风机", 299, "home", "lightlyUsed", "Glen Waverley", "sunny", "Sunny"),
     (11, "Motorcycle Helmet & Gloves", "摩托车头盔与手套", 120, "misc", "fullAccessories", "Doncaster", "allen", "Allen"),
-    (12, "Marketing Textbooks Bundle", "Marketing 教材资料", 40, "misc", "fullAccessories", "Clayton", "lily", "Lily"),
+    (12, "Marketing Textbooks Bundle", "市场营销教材资料", 40, "misc", "courseMaterials", "Clayton", "lily", "Lily"),
 ]
 
 IMAGES = {
@@ -50,9 +51,87 @@ SERVICES = [
     (103, "Product Photography", "商品摄影", 80, "Melbourne", "cameraService", "mia", "Mia_墨尔本"),
 ]
 
+SERVICE_IMAGES = {
+    101: 11,
+    102: 10,
+    103: 4,
+}
+
+INBOX_NOTIFICATIONS = [
+    (
+        "system",
+        "HeyMarket policy update",
+        "嘿市平台规则更新通知",
+        "We updated our community guidelines and escrow policy. Tap to read the summary.",
+        "我们更新了社区规范与担保交易规则，点击查看摘要。",
+        None,
+        None,
+        True,
+    ),
+    (
+        "system",
+        "Welcome to HeyMarket",
+        "欢迎加入嘿市",
+        "Your account is ready. Start browsing listings in Melbourne!",
+        "账号已就绪，快去墨尔本同城好物看看吧！",
+        None,
+        None,
+        True,
+    ),
+    (
+        "order",
+        "Your order has shipped",
+        "订单已发货",
+        "Your order has shipped — tap for details.",
+        "订单已发货，点击查看详情。",
+        "orders",
+        None,
+        True,
+    ),
+    (
+        "follow",
+        "Following updates",
+        "关注上新",
+        "A seller you follow listed 3 new items.",
+        "你关注的卖家上新了 3 件好物。",
+        "following",
+        None,
+        False,
+    ),
+]
+
+_AREA_ZH = {
+    "Clayton": "克莱顿",
+    "Melbourne CBD": "墨尔本市中心",
+    "Carlton": "卡尔顿",
+    "Box Hill": "博士山",
+    "Burwood": "布林伍德",
+    "Southbank": "南岸",
+    "Online": "线上",
+    "Docklands": "码头区",
+    "Richmond": "里士满",
+    "Glen Waverley": "格伦韦弗利",
+    "Doncaster": "唐卡斯特",
+    "Melbourne East": "墨尔本东区",
+    "Monash": "莫纳什",
+    "Melbourne": "墨尔本",
+    "Clayton / Box Hill": "克莱顿 / 博士山",
+    "Melbourne CBD / Southbank": "墨尔本市中心 / 南岸",
+}
+
+
+def _loc_zh(label: str) -> str:
+    return _AREA_ZH.get(label, label)
+
 
 def seed(db: Session) -> None:
     if db.query(Listing).first():
+        _sync_listing_translations(db)
+        _sync_user_avatars(db)
+        demo = db.query(User).filter(User.id == "12345678").first()
+        if demo:
+            _seed_inbox_notifications(db, demo.id)
+            db.commit()
         return
 
     sellers: dict[str, User] = {}
@@ -67,6 +146,7 @@ def seed(db: Session) -> None:
             password_hash=hash_password("demo123"),
             heishi_id=f"HS{abs(hash(key)) % 100000000:08d}"[:10],
             city="Melbourne",
+            avatar_url=avatar_url_for_user_id(key if len(key) > 8 else f"seller-{key}"),
         )
         db.add(user)
         db.flush()
@@ -85,7 +165,7 @@ def seed(db: Session) -> None:
             title=title,
             title_zh=title_zh,
             description=f"Quality {title} available in {loc}. Meetup or post available.",
-            description_zh=f"{title_zh}，{loc} 面交或邮寄。",
+            description_zh=f"{title_zh}，{_loc_zh(loc)} 面交或邮寄。",
             price=price,
             category_key=cat,
             tag_key=tag,
@@ -101,11 +181,54 @@ def seed(db: Session) -> None:
             view_count=10 + pid * 3,
             favorite_count=pid % 5,
         )
-        listing.images = [img]
+        extras = [IMAGES.get(((pid + offset - 1) % 12) + 1, img) for offset in (1, 2)]
+        listing.images = list(dict.fromkeys([img, *extras]))
         db.add(listing)
+
+    bundle_seller = get_seller("amy", "Amy")
+    bundle_listing = Listing(
+        id=200,
+        seller_id=bundle_seller.id,
+        type="bundle",
+        title="Clayton 2BR whole-home clearance",
+        title_zh="克莱顿两房整屋清仓",
+        description="Near Monash, pickup by Jun 28. Buy separately or as a bundle.",
+        description_zh="莫纳什附近，6月28日前自提。可整包也可单买。",
+        price=260,
+        category_key="home",
+        tag_key="bundleSet",
+        condition_key="lightlyUsed",
+        location_label="Clayton",
+        region_state="VIC",
+        region_city="Melbourne",
+        region_area="Clayton",
+        image_url=IMAGES[5],
+        status="active",
+        negotiable=True,
+        escrow_supported=True,
+        view_count=48,
+        favorite_count=12,
+    )
+    bundle_listing.images = [IMAGES[5], IMAGES[2], IMAGES[10], IMAGES[4]]
+    bundle_listing.pickup_methods = ["meetup"]
+    bundle_listing.bundle_meta = {
+        "fullPrice": 260,
+        "pickupDeadline": "2026-06-28",
+        "allowSeparateSale": True,
+        "pickupWindow": "weekdayEvening",
+        "totalItems": 4,
+        "items": [
+            {"id": "desk", "title": "Nordic folding desk", "sharePrice": 35, "separatePrice": 35, "imageUrl": IMAGES[5], "status": "available"},
+            {"id": "microwave", "title": "Microwave", "sharePrice": 45, "imageUrl": IMAGES[2], "status": "onHold"},
+            {"id": "chairs", "title": "Dining chairs (x2)", "sharePrice": 20, "separatePrice": 20, "imageUrl": IMAGES[10], "status": "available"},
+            {"id": "bedFrame", "title": "Queen bed frame", "sharePrice": 40, "imageUrl": IMAGES[4], "status": "sold"},
+        ],
+    }
+    db.add(bundle_listing)
 
     for sid, title, title_zh, price, area, icon, skey, snick in SERVICES:
         seller = get_seller(skey, snick)
+        img = IMAGES.get(SERVICE_IMAGES.get(sid, 7), IMAGES[7])
         listing = Listing(
             id=sid,
             seller_id=seller.id,
@@ -113,7 +236,7 @@ def seed(db: Session) -> None:
             title=title,
             title_zh=title_zh,
             description=f"Professional {title} in {area}.",
-            description_zh=f"专业{title_zh}，服务区域：{area}。",
+            description_zh=f"专业{title_zh}，服务区域：{_loc_zh(area)}。",
             price=price,
             category_key="services",
             tag_key="localService",
@@ -121,11 +244,11 @@ def seed(db: Session) -> None:
             region_state="VIC",
             region_city="Melbourne",
             region_area="Clayton",
-            image_url=IMAGES[7],
+            image_url=img,
             status="active",
             service_icon=icon,
         )
-        listing.images = [IMAGES[7]]
+        listing.images = [img]
         db.add(listing)
 
     demo = User(
@@ -136,6 +259,7 @@ def seed(db: Session) -> None:
         heishi_id="HS12345678",
         city="Melbourne",
         language="en",
+        avatar_url=avatar_url_for_user_id("12345678"),
     )
     db.add(demo)
     db.flush()
@@ -144,12 +268,56 @@ def seed(db: Session) -> None:
     db.add(PaymentMethod(user_id=demo.id, type="apple_pay", label="Apple Pay", is_default=False))
     db.add(Coupon(user_id=demo.id, amount=5, description="Welcome coupon A$5 off", status="available"))
     db.add(Coupon(user_id=demo.id, amount=10, description="Referral bonus A$10", status="available"))
-    db.add(
-        SystemNotification(
-            user_id=demo.id,
-            title="Welcome to HeyMarket",
-            body="Your account is ready. Start browsing listings in Melbourne!",
-            unread=True,
+    _seed_inbox_notifications(db, demo.id)
+    db.commit()
+
+
+def _seed_inbox_notifications(db: Session, user_id: str) -> None:
+    existing = db.query(SystemNotification).filter(SystemNotification.user_id == user_id).count()
+    if existing >= len(INBOX_NOTIFICATIONS):
+        return
+    if existing:
+        db.query(SystemNotification).filter(SystemNotification.user_id == user_id).delete()
+    for cat, title, title_zh, body, body_zh, action_type, action_ref, unread in INBOX_NOTIFICATIONS:
+        db.add(
+            SystemNotification(
+                user_id=user_id,
+                category=cat,
+                title=title,
+                title_zh=title_zh,
+                body=body,
+                body_zh=body_zh,
+                action_type=action_type,
+                action_ref=action_ref,
+                unread=unread,
+            )
         )
-    )
+
+
+def _sync_user_avatars(db: Session) -> None:
+    """Apply portrait URLs to demo users when seed data changes (existing DB)."""
+    for user in db.query(User).all():
+        url = avatar_url_for_user_id(user.id)
+        if url and user.avatar_url != url:
+            user.avatar_url = url
+    db.commit()
+
+
+def _sync_listing_translations(db: Session) -> None:
+    """Refresh demo listing Chinese titles when seed data changes (existing DB)."""
+    for pid, title, title_zh, _price, _cat, tag, loc, _skey, _snick in PRODUCTS:
+        listing = db.query(Listing).filter(Listing.id == pid).first()
+        if not listing:
+            continue
+        listing.title = title
+        listing.title_zh = title_zh
+        listing.tag_key = tag
+        listing.description_zh = f"{title_zh}，{_loc_zh(loc)} 面交或邮寄。"
+    for sid, title, title_zh, _price, area, _icon, _skey, _snick in SERVICES:
+        listing = db.query(Listing).filter(Listing.id == sid).first()
+        if not listing:
+            continue
+        listing.title = title
+        listing.title_zh = title_zh
+        listing.description_zh = f"专业{title_zh}，服务区域：{_loc_zh(area)}。"
     db.commit()

@@ -1,15 +1,33 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from PIL import UnidentifiedImageError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language
 from app.catalog_helpers import apply_region_filter, apply_search, apply_tab_filter
 from app.database import get_db
+from app.form_options import LISTING_FORM_OPTIONS
+from app.image_search import hamming_distance, hash_image_bytes, hash_image_url, is_similar_enough
 from app.models import Listing
 from app.pagination import paginate
-from app.schemas import ListingDetailDto, ListingSummaryDto, LocalServiceDto, Paginated, SuggestionDto
+from app.schemas import (
+    ImageSearchResponseDto,
+    ListingDetailDto,
+    ListingFormOptionsDto,
+    ListingSummaryDto,
+    LocalServiceDto,
+    Paginated,
+    SuggestionDto,
+)
 from app.serializers import listing_to_detail, listing_to_service, listing_to_summary
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
+
+
+@router.get("/form-options", response_model=ListingFormOptionsDto)
+def get_form_options():
+    return LISTING_FORM_OPTIONS
 
 
 @router.get("/feed", response_model=Paginated[ListingSummaryDto])
@@ -34,6 +52,74 @@ def get_feed(
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
     return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+
+
+@router.post("/search/image", response_model=ImageSearchResponseDto)
+async def search_by_image(
+    request: Request,
+    file: UploadFile = File(...),
+    regionState: str | None = None,
+    regionCity: str | None = None,
+    regionArea: str | None = None,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    data = await file.read()
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": "Image file is empty", "details": {}},
+        )
+
+    try:
+        query_hash = hash_image_bytes(data)
+    except UnidentifiedImageError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": "Unsupported image format", "details": {}},
+        )
+
+    q = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.status == "active")
+    q = apply_region_filter(q, regionState, regionCity, regionArea)
+    listings = q.all()
+
+    scored: list[tuple[int, Listing]] = []
+    for listing in listings:
+        img_url = listing.image_url or (listing.images[0] if listing.images else None)
+        if not img_url:
+            continue
+        listing_hash = hash_image_url(img_url) if img_url.startswith("http") else None
+        if not listing_hash:
+            continue
+        distance = hamming_distance(query_hash, listing_hash)
+        if is_similar_enough(distance):
+            scored.append((distance, listing))
+
+    scored.sort(key=lambda item: item[0])
+    total = len(scored)
+    offset = (page - 1) * pageSize
+    page_items = scored[offset : offset + pageSize]
+    summaries = [listing_to_summary(listing, lang) for _, listing in page_items]
+
+    top = scored[0][1] if scored else None
+    if top:
+        suggested = top.title_zh if lang == "zh" and top.title_zh else top.title
+    else:
+        stem = Path(file.filename or "photo").stem.strip()
+        suggested = stem if stem and stem.lower() not in {"photo", "image", "img"} else ""
+
+    page_result = paginate(summaries, page, pageSize, total)
+    return ImageSearchResponseDto(
+        suggestedQuery=suggested,
+        matchCount=total,
+        items=page_result.items,
+        page=page_result.page,
+        pageSize=page_result.pageSize,
+        total=page_result.total,
+        hasMore=page_result.hasMore,
+    )
 
 
 @router.get("/search", response_model=Paginated[ListingSummaryDto])

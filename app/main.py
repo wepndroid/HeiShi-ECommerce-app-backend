@@ -10,12 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.routers import auth, catalog, listings, messages, orders, region_safety, user_data, users
+from app.migrations import run_migrations
 from app.seed import seed
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     db = SessionLocal()
     try:
         seed(db)
