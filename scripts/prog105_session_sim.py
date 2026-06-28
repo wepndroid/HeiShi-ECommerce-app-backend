@@ -117,7 +117,11 @@ def main() -> int:
         storage["authRefreshToken"] = tokens["refreshToken"]
         user = bootstrap_api_mode(storage)
         record("Bootstrap restores session after relaunch", user and user["nickname"] == "Holden")
-        record("Bootstrap UUID id", bool(user and "-" in user["id"]), user["id"] if user else "")
+        record(
+            "Bootstrap user id present and distinct from heishiId",
+            bool(user and user.get("id") and user["id"] != user.get("heishiId")),
+            f"{user['id']} vs {user.get('heishiId')}" if user else "",
+        )
         record(
             "Bootstrap heishiId present",
             bool(user and user["heishiId"].startswith("HS")),

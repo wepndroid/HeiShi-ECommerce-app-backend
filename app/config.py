@@ -12,6 +12,17 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     upload_dir: str = "uploads"
     escrow_fee: float = 0.99
+    pending_pay_expire_minutes: int = 30
+    expose_dev_otp: bool = True
+
+    # Supabase Auth (Path A — phone OTP). When jwt_secret is set, API accepts Supabase JWTs.
+    supabase_url: str = ""
+    supabase_jwt_secret: str = ""
+    supabase_service_role_key: str = ""
+
+    @property
+    def supabase_auth_enabled(self) -> bool:
+        return bool(self.supabase_jwt_secret.strip())
 
     @property
     def cors_origin_list(self) -> list[str]:

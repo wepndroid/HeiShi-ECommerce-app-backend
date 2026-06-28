@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.auth import hash_password, normalize_phone
 from app.avatar_photos import avatar_url_for_user_id
+from app.auth import hash_password, normalize_phone
+from app.coupon_service import issue_referral_coupon, issue_welcome_coupon
 from app.models import (
     Coupon,
     Listing,
@@ -131,6 +132,8 @@ def seed(db: Session) -> None:
         demo = db.query(User).filter(User.id == "12345678").first()
         if demo:
             _seed_inbox_notifications(db, demo.id)
+            issue_welcome_coupon(db, demo.id, demo.language)
+            issue_referral_coupon(db, demo.id, demo.language)
             db.commit()
         return
 
@@ -209,7 +212,7 @@ def seed(db: Session) -> None:
         view_count=48,
         favorite_count=12,
     )
-    bundle_listing.images = [IMAGES[5], IMAGES[2], IMAGES[10], IMAGES[4]]
+    bundle_listing.images = [IMAGES[0]]
     bundle_listing.pickup_methods = ["meetup"]
     bundle_listing.bundle_meta = {
         "fullPrice": 260,
@@ -217,6 +220,7 @@ def seed(db: Session) -> None:
         "allowSeparateSale": True,
         "pickupWindow": "weekdayEvening",
         "totalItems": 4,
+        "coverImageUrls": [IMAGES[0]],
         "items": [
             {"id": "desk", "title": "Nordic folding desk", "sharePrice": 35, "separatePrice": 35, "imageUrl": IMAGES[5], "status": "available"},
             {"id": "microwave", "title": "Microwave", "sharePrice": 45, "imageUrl": IMAGES[2], "status": "onHold"},
@@ -266,8 +270,20 @@ def seed(db: Session) -> None:
     db.add(UserSettings(user_id=demo.id))
     db.add(PaymentMethod(user_id=demo.id, type="card", label="Visa •••• 4242", last4="4242", is_default=True))
     db.add(PaymentMethod(user_id=demo.id, type="apple_pay", label="Apple Pay", is_default=False))
-    db.add(Coupon(user_id=demo.id, amount=5, description="Welcome coupon A$5 off", status="available"))
-    db.add(Coupon(user_id=demo.id, amount=10, description="Referral bonus A$10", status="available"))
+    db.add(Coupon(
+        user_id=demo.id,
+        amount=5,
+        description="Welcome coupon A$5 off",
+        kind="welcome",
+        status="available",
+    ))
+    db.add(Coupon(
+        user_id=demo.id,
+        amount=10,
+        description="Referral bonus A$10",
+        kind="referral",
+        status="available",
+    ))
     _seed_inbox_notifications(db, demo.id)
     db.commit()
 
@@ -298,7 +314,7 @@ def _sync_user_avatars(db: Session) -> None:
     """Apply portrait URLs to demo users when seed data changes (existing DB)."""
     for user in db.query(User).all():
         url = avatar_url_for_user_id(user.id)
-        if url and user.avatar_url != url:
+        if url and not user.avatar_url:
             user.avatar_url = url
     db.commit()
 

@@ -188,3 +188,16 @@ def block_user(target_user_id: str, user: User = Depends(get_current_user), db: 
         db.add(BlocklistEntry(blocker_id=user.id, blocked_id=target_user_id))
         db.commit()
     return Response(status_code=204)
+
+
+@router.delete("/safety/blocklist/{target_user_id}", status_code=204)
+def unblock_user(target_user_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    entry = (
+        db.query(BlocklistEntry)
+        .filter(BlocklistEntry.blocker_id == user.id, BlocklistEntry.blocked_id == target_user_id)
+        .first()
+    )
+    if entry:
+        db.delete(entry)
+        db.commit()
+    return Response(status_code=204)

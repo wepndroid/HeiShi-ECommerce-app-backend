@@ -1,14 +1,15 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session, joinedload
 
-from app.auth import get_current_user
+from app.auth import get_accept_language, get_current_user
+from app.coupon_service import refresh_expired_coupons
 from app.database import get_db
 from app.models import Coupon, Favorite, Follow, Listing, User, ViewHistory
 from app.pagination import paginate
-from app.schemas import CouponDto, FavoriteDto, FollowDto, Paginated
-from app.serializers import coupon_to_dto, favorite_to_dto, follow_to_dto, iso
+from app.schemas import CouponDto, FavoriteDto, FollowDto, ListingSummaryDto, Paginated
+from app.serializers import coupon_to_dto, favorite_to_dto, follow_to_dto, iso, listing_to_summary
 
 router = APIRouter(tags=["user-library"])
 
@@ -26,11 +27,37 @@ def list_favorites(
     return paginate([favorite_to_dto(f.listing_id, f.created_at) for f in items], page, pageSize, total)
 
 
+@router.get("/favorites/listings", response_model=Paginated[ListingSummaryDto])
+def list_favorite_listings(
+    request: Request,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    q = (
+        db.query(Listing)
+        .options(joinedload(Listing.seller))
+        .join(Favorite, Favorite.listing_id == Listing.id)
+        .filter(Favorite.user_id == user.id)
+        .order_by(Favorite.created_at.desc())
+    )
+    total = q.count()
+    items = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+
+
 @router.post("/favorites/{listing_id}", response_model=FavoriteDto, status_code=201)
 def add_favorite(listing_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     listing = db.query(Listing).filter(Listing.id == listing_id).first()
     if not listing:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
+    if listing.seller_id == user.id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Cannot favorite own listing", "details": {}},
+        )
     fav = db.query(Favorite).filter(Favorite.user_id == user.id, Favorite.listing_id == listing_id).first()
     if fav:
         return favorite_to_dto(fav.listing_id, fav.created_at)
@@ -68,6 +95,27 @@ def list_history(
     return paginate(dto_items, page, pageSize, total)
 
 
+@router.get("/history/listings", response_model=Paginated[ListingSummaryDto])
+def list_history_listings(
+    request: Request,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    q = (
+        db.query(Listing)
+        .options(joinedload(Listing.seller))
+        .join(ViewHistory, ViewHistory.listing_id == Listing.id)
+        .filter(ViewHistory.user_id == user.id)
+        .order_by(ViewHistory.viewed_at.desc())
+    )
+    total = q.count()
+    items = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+
+
 @router.post("/history/views/{listing_id}", status_code=204)
 def record_view(listing_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     listing = db.query(Listing).filter(Listing.id == listing_id).first()
@@ -79,17 +127,20 @@ def record_view(listing_id: int, user: User = Depends(get_current_user), db: Ses
         record.viewed_at = now
     else:
         db.add(ViewHistory(user_id=user.id, listing_id=listing_id, viewed_at=now))
+        listing.view_count = (listing.view_count or 0) + 1
     db.commit()
     return Response(status_code=204)
 
 
 @router.get("/follows", response_model=Paginated[FollowDto])
 def list_follows(
+    request: Request,
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    lang = get_accept_language(request)
     q = (
         db.query(Follow)
         .filter(Follow.follower_id == user.id)
@@ -101,7 +152,7 @@ def list_follows(
     for f in follows:
         followed = db.query(User).filter(User.id == f.followed_id).first()
         if followed:
-            items.append(follow_to_dto(followed, f.created_at))
+            items.append(follow_to_dto(followed, f.created_at, lang))
     return paginate(items, page, pageSize, total)
 
 
@@ -136,6 +187,7 @@ def list_coupons(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    refresh_expired_coupons(db, user.id)
     q = db.query(Coupon).filter(Coupon.user_id == user.id)
     if status:
         q = q.filter(Coupon.status == status)
@@ -147,11 +199,15 @@ def list_coupons(
 
 @router.post("/coupons/{coupon_id}/redeem", status_code=204)
 def redeem_coupon(coupon_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    refresh_expired_coupons(db, user.id)
     coupon = db.query(Coupon).filter(Coupon.id == coupon_id, Coupon.user_id == user.id).first()
     if not coupon:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Coupon not found", "details": {}})
     if coupon.status != "available":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Coupon not available", "details": {}})
-    coupon.status = "used"
-    db.commit()
+    if coupon.expires_at and coupon.expires_at < datetime.now(timezone.utc):
+        coupon.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Coupon expired", "details": {}})
+    # Coupons are marked used on order pay; redeem only validates availability for legacy clients.
     return Response(status_code=204)

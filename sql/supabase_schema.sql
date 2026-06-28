@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS coupons (
     user_id     VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     amount      DOUBLE PRECISION NOT NULL,
     description VARCHAR(200) NOT NULL,
+    kind        VARCHAR(30),
     expires_at  TIMESTAMPTZ,
     status      VARCHAR(20) NOT NULL DEFAULT 'available'
 );
@@ -169,6 +170,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     last_message_at   TIMESTAMPTZ,
     buyer_unread      INTEGER NOT NULL DEFAULT 0,
     seller_unread     INTEGER NOT NULL DEFAULT 0,
+    buyer_read_inbox_at  TIMESTAMPTZ,
+    seller_read_inbox_at TIMESTAMPTZ,
+    buyer_marked_unread  BOOLEAN NOT NULL DEFAULT FALSE,
+    seller_marked_unread BOOLEAN NOT NULL DEFAULT FALSE,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

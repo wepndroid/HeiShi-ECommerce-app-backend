@@ -25,11 +25,31 @@ class RegisterRequest(BaseModel):
     nickname: str = Field(min_length=1, max_length=50)
     phone: str
     password: str = Field(min_length=6)
+    verificationCode: str = Field(min_length=6, max_length=6)
+    avatarUrl: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class SendRegisterCodeRequest(BaseModel):
+    phone: str
+
+
+class SendRegisterCodeResponse(BaseModel):
+    expiresIn: int
+    resendAfter: int
+    devCode: str | None = None
 
 
 class LoginRequest(BaseModel):
     phone: str
     password: str
+
+
+class SyncProfileRequest(BaseModel):
+    """Create/update app profile after Supabase phone OTP verification."""
+
+    nickname: str = Field(min_length=1, max_length=50)
+    phone: str | None = None
+    avatarUrl: str = Field(min_length=1, max_length=500)
 
 
 class RefreshRequest(BaseModel):
@@ -73,9 +93,11 @@ class ListingSummaryDto(BaseModel):
     tagKey: str
     locationLabel: str
     imageUrl: str
+    images: list[str] = Field(default_factory=list)
     seller: SellerDto
     status: Literal["active", "draft", "sold", "inactive"]
     createdAt: str
+    favoriteCount: int | None = None
 
 
 class ListingDetailDto(ListingSummaryDto):
@@ -87,9 +109,14 @@ class ListingDetailDto(ListingSummaryDto):
     viewCount: int | None = None
     favoriteCount: int | None = None
     bundleMeta: dict | None = None
+    purchaseAvailable: bool = True
+    serviceIcon: str | None = None
+    meetInPublic: bool | None = None
+    escrowFee: float | None = None
 
 
 class BundleItemRequest(BaseModel):
+    id: str | None = None
     title: str = Field(min_length=1, max_length=120)
     sharePrice: float = Field(gt=0)
     separatePrice: float | None = Field(default=None, gt=0)
@@ -107,12 +134,19 @@ class CreateListingRequest(BaseModel):
     conditionKey: str | None = None
     tagKey: str | None = None
     locationLabel: str
+    regionState: str | None = None
+    regionCity: str | None = None
     imageUrls: list[str]
     pickupMethods: list[str] | None = None
     bundleItems: list[BundleItemRequest] | None = None
     pickupDeadline: str | None = None
     allowSeparateSale: bool | None = True
     pickupWindow: str | None = None
+    serviceIcon: str | None = None
+    escrowSupported: bool | None = None
+    negotiable: bool | None = None
+    meetInPublic: bool | None = None
+    status: Literal["active", "draft"] | None = None
 
 
 class LocalServiceDto(BaseModel):
@@ -132,6 +166,7 @@ class SuggestionDto(BaseModel):
     listingId: int
     title: str
     subtitle: str
+    imageUrl: str | None = None
 
 
 class ImageSearchResponseDto(BaseModel):
@@ -155,6 +190,14 @@ class CreateOrderRequest(BaseModel):
     listingId: int
     deliveryMethod: str
     paymentMethodId: str | None = None
+    bundleItemId: str | None = None
+    couponId: str | None = None
+
+
+class UpdateOrderRequest(BaseModel):
+    deliveryMethod: str | None = None
+    paymentMethodId: str | None = None
+    couponId: str | None = None
 
 
 class OrderDto(BaseModel):
@@ -163,10 +206,16 @@ class OrderDto(BaseModel):
     listingTitle: str
     listingImageUrl: str
     seller: SellerDto
+    buyer: SellerDto | None = None
     status: Literal["pendingPay", "pendingShip", "pendingReceive", "pendingReview", "completed", "cancelled"]
     amount: float
     escrowFee: float
     currency: Literal["AUD"] = "AUD"
+    deliveryMethod: str | None = None
+    paymentMethodId: str | None = None
+    bundleItemId: str | None = None
+    couponId: str | None = None
+    discountAmount: float | None = None
     createdAt: str
     updatedAt: str
 
@@ -174,6 +223,12 @@ class OrderDto(BaseModel):
 class ReviewRequest(BaseModel):
     rating: int = Field(ge=1, le=5)
     comment: str | None = None
+
+
+class OrderReviewDto(BaseModel):
+    rating: int
+    comment: str | None = None
+    createdAt: str
 
 
 # User library
@@ -191,6 +246,7 @@ class FollowDto(BaseModel):
     userId: str
     nickname: str
     subtitle: str | None = None
+    avatarUrl: str | None = None
     followedAt: str
 
 
@@ -217,6 +273,7 @@ class ListingRefDto(BaseModel):
     price: float | None = None
     locationLabel: str | None = None
     currency: Literal["AUD"] = "AUD"
+    status: Literal["active", "draft", "sold", "inactive"] | None = None
 
 
 class LastMessageDto(BaseModel):
@@ -230,6 +287,15 @@ class ConversationDto(BaseModel):
     listing: ListingRefDto | None = None
     lastMessage: LastMessageDto | None = None
     unreadCount: int
+    markedAsUnread: bool = False
+
+
+class MarkConversationReadRequest(BaseModel):
+    maxMessageId: str | None = None
+
+
+class MarkConversationUnreadRequest(BaseModel):
+    markedAsUnread: bool
 
 
 class ChatMessageDto(BaseModel):
@@ -238,6 +304,7 @@ class ChatMessageDto(BaseModel):
     senderId: str
     text: str
     sentAt: str
+    ackRead: bool = False
 
 
 class OpenConversationRequest(BaseModel):
@@ -299,6 +366,13 @@ class AddressDto(BaseModel):
 class AddressCreateRequest(BaseModel):
     label: str
     area: str
+    meetupSpot: str | None = None
+    isDefault: bool | None = None
+
+
+class AddressUpdateRequest(BaseModel):
+    label: str | None = None
+    area: str | None = None
     meetupSpot: str | None = None
     isDefault: bool | None = None
 
@@ -383,8 +457,47 @@ class PrivacySettingsDto(BaseModel):
     personalization: bool
 
 
+class TransactionReminderSettingsDto(BaseModel):
+    payAlerts: bool
+    shipAlerts: bool
+    receiveAlerts: bool
+    disputeAlerts: bool
+
+
 class CacheClearResponse(BaseModel):
     freedBytes: int
+
+
+class ChangePasswordRequest(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+class BindVerificationRequest(BaseModel):
+    type: Literal["wechat", "alipay", "identity", "business"]
+
+
+class SetDefaultMethodRequest(BaseModel):
+    isDefault: bool = True
+
+
+class DataExportDto(BaseModel):
+    exportedAt: str
+    profile: AuthUserDto
+    notificationSettings: NotificationSettingsDto
+    privacySettings: PrivacySettingsDto
+    transactionReminderSettings: TransactionReminderSettingsDto
+    addresses: list[AddressDto]
+    verification: VerificationStatusDto
+
+
+class RegisterPushTokenRequest(BaseModel):
+    token: str
+    platform: Literal["android", "ios", "web"]
+
+
+class RemovePushTokenRequest(BaseModel):
+    token: str
 
 
 # Region & safety

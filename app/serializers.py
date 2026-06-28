@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 
+from app.config import settings
 from app.avatar_photos import avatar_url_for_user_id
+from app.media_urls import normalize_media_url, normalize_media_urls
+from app.messaging_read import marked_as_unread, message_ack_read
 from app.models import (
     Address,
     Conversation,
@@ -42,6 +45,7 @@ from app.schemas import (
     SystemNotificationDto,
     InboxNotificationDto,
     NotificationGroupDto,
+    TransactionReminderSettingsDto,
     VerificationStatusDto,
 )
 
@@ -55,7 +59,10 @@ def iso(dt: datetime | None) -> str:
 
 
 def _user_avatar_url(user: User) -> str | None:
-    return user.avatar_url or avatar_url_for_user_id(user.id)
+    """Return the user's uploaded avatar only — no stock-photo fallback for real accounts."""
+    if user.avatar_url:
+        return normalize_media_url(user.avatar_url)
+    return avatar_url_for_user_id(user.id)
 
 
 def user_to_dto(user: User) -> AuthUserDto:
@@ -146,6 +153,8 @@ def listing_description(listing: Listing, lang: str = "en") -> str | None:
 def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
     listing_type = listing.type if listing.type in ("product", "service", "bundle") else "product"
     status = listing.status if listing.status in ("active", "draft", "sold", "inactive") else "active"
+    images = normalize_media_urls(listing.images)
+    cover = images[0] if images else normalize_media_url(listing.image_url)
     return ListingSummaryDto(
         id=listing.id,
         type=listing_type,
@@ -155,31 +164,76 @@ def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
         categoryKey=listing.category_key,
         tagKey=listing.tag_key,
         locationLabel=listing.location_label,
-        imageUrl=listing.image_url,
+        imageUrl=cover or "",
+        images=images,
         seller=seller_to_dto(listing.seller, lang),
         status=status,
         createdAt=iso(listing.created_at),
+        favoriteCount=listing.favorite_count or 0,
     )
+
+
+def _infer_bundle_cover_urls(listing_images: list[str], items: list[dict]) -> list[str]:
+    listing = normalize_media_urls(listing_images or [])
+    if not listing:
+        return []
+    item_photos: list[str] = []
+    for item in items:
+        urls = list(item.get("imageUrls") or [])
+        if not urls and item.get("imageUrl"):
+            urls = [item["imageUrl"]]
+        item_photos.extend(normalize_media_urls(urls))
+    if not item_photos:
+        return listing
+    item_set = set(item_photos)
+    exclusive = [url for url in listing if url not in item_set]
+    if len(exclusive) == len(listing):
+        return listing
+    naive_len = max(len(listing) - len(item_photos), 1)
+    covers = list(listing[:naive_len])
+    if (
+        len(covers) < len(listing)
+        and listing[len(covers)] in item_set
+        and listing[len(covers)] not in covers
+    ):
+        covers.append(listing[len(covers)])
+    if covers:
+        return covers
+    return exclusive if exclusive else [listing[0]]
 
 
 def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
     summary = listing_to_summary(listing, lang)
-    bundle_meta = listing.bundle_meta if listing.type == "bundle" and listing.bundle_meta else None
+    bundle_meta = None
+    if listing.type == "bundle":
+        raw_meta = listing.bundle_meta or {}
+        if isinstance(raw_meta, dict) and raw_meta:
+            bundle_meta = dict(raw_meta)
+            items = bundle_meta.get("items") or []
+            listing_images = normalize_media_urls(listing.images or [])
+            if not bundle_meta.get("coverImageUrls"):
+                if items:
+                    bundle_meta["coverImageUrls"] = _infer_bundle_cover_urls(listing_images, items)
+                elif listing_images:
+                    bundle_meta["coverImageUrls"] = listing_images
     return ListingDetailDto(
         **summary.model_dump(),
-        images=listing.images,
         conditionKey=listing.condition_key,
         negotiable=listing.negotiable,
         escrowSupported=listing.escrow_supported,
+        meetInPublic=listing.meet_in_public,
         pickupMethods=listing.pickup_methods,
+        escrowFee=settings.escrow_fee if listing.escrow_supported else 0.0,
         viewCount=listing.view_count,
         favoriteCount=listing.favorite_count,
         bundleMeta=bundle_meta if bundle_meta else None,
+        serviceIcon=listing.service_icon if listing.type == "service" else None,
     )
 
 
 def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
     icon = listing.service_icon if listing.service_icon in ("truck", "broom", "cameraService") else "truck"
+    cover = normalize_media_url(listing.image_url)
     return LocalServiceDto(
         id=listing.id,
         title=listing_title(listing, lang),
@@ -187,24 +241,31 @@ def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
         priceFrom=listing.price,
         area=listing.location_label,
         icon=icon,
-        imageUrl=listing.image_url,
+        imageUrl=cover or "",
         seller=seller_to_dto(listing.seller, lang),
     )
 
 
-def order_to_dto(order: Order, lang: str = "en") -> OrderDto:
+def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False) -> OrderDto:
     status = order.status if order.status in (
         "pendingPay", "pendingShip", "pendingReceive", "pendingReview", "completed", "cancelled"
     ) else "pendingPay"
+    buyer = seller_to_dto(order.buyer, lang) if include_buyer and order.buyer else None
     return OrderDto(
         id=order.id,
         listingId=order.listing_id,
         listingTitle=listing_title(order.listing, lang),
-        listingImageUrl=order.listing.image_url,
+        listingImageUrl=normalize_media_url(order.listing.image_url) or "",
         seller=seller_to_dto(order.seller, lang),
+        buyer=buyer,
         status=status,
         amount=order.amount,
         escrowFee=order.escrow_fee,
+        deliveryMethod=order.delivery_method,
+        paymentMethodId=order.payment_method_id,
+        bundleItemId=order.bundle_item_id,
+        couponId=order.coupon_id,
+        discountAmount=order.discount_amount if order.discount_amount else None,
         createdAt=iso(order.created_at),
         updatedAt=iso(order.updated_at),
     )
@@ -214,11 +275,15 @@ def favorite_to_dto(listing_id: int, created_at: datetime) -> FavoriteDto:
     return FavoriteDto(listingId=listing_id, createdAt=iso(created_at))
 
 
-def follow_to_dto(user: User, followed_at: datetime) -> FollowDto:
+def follow_to_dto(user: User, followed_at: datetime, lang: str = "en") -> FollowDto:
+    nickname = user.nickname
+    if lang == "zh":
+        nickname = _SELLER_NICKNAME_ZH.get(user.id, nickname)
     return FollowDto(
         userId=user.id,
-        nickname=user.nickname,
+        nickname=nickname,
         subtitle=user.city,
+        avatarUrl=_user_avatar_url(user),
         followedAt=iso(followed_at),
     )
 
@@ -241,12 +306,14 @@ def conversation_to_dto(conv: Conversation, current_user_id: str, lang: str = "e
     last_msg = None
     if conv.last_message_text and conv.last_message_at:
         last_msg = LastMessageDto(text=conv.last_message_text, sentAt=iso(conv.last_message_at))
+    listing_cover = normalize_media_url(conv.listing.image_url)
     listing_ref = ListingRefDto(
         id=conv.listing.id,
         title=listing_title(conv.listing, lang),
-        imageUrl=conv.listing.image_url,
+        imageUrl=listing_cover or "",
         price=conv.listing.price,
         locationLabel=conv.listing.location_label,
+        status=conv.listing.status if conv.listing.status in ("active", "draft", "sold", "inactive") else "active",
     )
     return ConversationDto(
         id=conv.id,
@@ -258,16 +325,21 @@ def conversation_to_dto(conv: Conversation, current_user_id: str, lang: str = "e
         listing=listing_ref,
         lastMessage=last_msg,
         unreadCount=unread,
+        markedAsUnread=marked_as_unread(conv, current_user_id),
     )
 
 
-def message_to_dto(msg: Message) -> ChatMessageDto:
+def message_to_dto(msg: Message, conv: Conversation | None = None, viewer_id: str | None = None) -> ChatMessageDto:
+    ack_read = False
+    if conv is not None and viewer_id is not None:
+        ack_read = message_ack_read(conv, msg, viewer_id)
     return ChatMessageDto(
         id=msg.id,
         conversationId=msg.conversation_id,
         senderId=msg.sender_id,
         text=msg.text,
         sentAt=iso(msg.sent_at),
+        ackRead=ack_read,
     )
 
 
@@ -308,6 +380,15 @@ def settings_to_privacy(s: UserSettings) -> PrivacySettingsDto:
     )
 
 
+def settings_to_transaction_reminders(s: UserSettings) -> TransactionReminderSettingsDto:
+    return TransactionReminderSettingsDto(
+        payAlerts=s.remind_pay,
+        shipAlerts=s.remind_ship,
+        receiveAlerts=s.remind_receive,
+        disputeAlerts=s.remind_dispute,
+    )
+
+
 def verification_to_dto(user: User) -> VerificationStatusDto:
     return VerificationStatusDto(
         phoneVerified=user.phone_verified,
@@ -318,11 +399,11 @@ def verification_to_dto(user: User) -> VerificationStatusDto:
     )
 
 
-def credit_profile(user_id: str, db_orders: int, rating: float) -> CreditProfileDto:
+def credit_profile(user_id: str, db_orders: int, rating: float, completion_rate: float) -> CreditProfileDto:
     return CreditProfileDto(
         score=min(850, 600 + db_orders * 10),
         trades=db_orders,
-        completionRate=1.0 if db_orders == 0 else 0.95,
+        completionRate=completion_rate,
         violations=0,
         rating=rating,
     )

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import RefreshToken, User
+from app.supabase_auth import decode_supabase_jwt, phone_from_claims
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
@@ -21,7 +22,12 @@ AU_PHONE_RE = re.compile(r"^(\+?61|0)\d{8,10}$")
 
 
 def normalize_phone(phone: str) -> str:
-    return re.sub(r"\s+", "", phone.strip())
+    cleaned = re.sub(r"\s+", "", phone.strip())
+    if cleaned.startswith("+61"):
+        return f"0{cleaned[3:]}"
+    if cleaned.startswith("61") and len(cleaned) >= 11:
+        return f"0{cleaned[2:]}"
+    return cleaned
 
 
 def is_valid_au_phone(phone: str) -> bool:
@@ -97,14 +103,9 @@ def validate_refresh_token(db: Session, token: str) -> User | None:
     return user
 
 
-def get_current_user_optional(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    db: Session = Depends(get_db),
-) -> User | None:
-    if not credentials:
-        return None
+def _user_from_legacy_token(token: str, db: Session) -> User | None:
     try:
-        payload = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
         if payload.get("type") != "access":
             return None
         user_id = payload.get("sub")
@@ -113,6 +114,28 @@ def get_current_user_optional(
     except JWTError:
         return None
     return db.query(User).filter(User.id == user_id).first()
+
+
+def _user_from_supabase_token(token: str, db: Session) -> User | None:
+    claims = decode_supabase_jwt(token)
+    if not claims:
+        return None
+    user_id = claims["sub"]
+    return db.query(User).filter(User.id == user_id).first()
+
+
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
+) -> User | None:
+    if not credentials:
+        return None
+    token = credentials.credentials
+    if settings.supabase_auth_enabled:
+        user = _user_from_supabase_token(token, db)
+        if user:
+            return user
+    return _user_from_legacy_token(token, db)
 
 
 def get_current_user(user: User | None = Depends(get_current_user_optional)) -> User:

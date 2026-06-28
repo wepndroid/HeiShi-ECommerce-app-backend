@@ -1,20 +1,25 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
 from app.catalog_helpers import get_or_create_settings
 from app.database import get_db
-from app.models import Address, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings
+from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, ViewHistory
 from app.schemas import (
     AddPaymentMethodRequest,
     AddPayoutMethodRequest,
     AddressCreateRequest,
+    AddressUpdateRequest,
     AddressDto,
     AuthUserDto,
+    BindVerificationRequest,
     CacheClearResponse,
     CreditProfileDto,
+    DataExportDto,
     NotificationSettingsDto,
     PaymentMethodDto,
     PayoutMethodDto,
@@ -22,7 +27,11 @@ from app.schemas import (
     Paginated,
     PrivacySettingsDto,
     PublicUserProfileDto,
+    RegisterPushTokenRequest,
+    RemovePushTokenRequest,
     ReviewSummaryDto,
+    SetDefaultMethodRequest,
+    TransactionReminderSettingsDto,
     UserProfileUpdateRequest,
     VerificationStatusDto,
 )
@@ -38,11 +47,19 @@ from app.serializers import (
     review_summary,
     settings_to_notification,
     settings_to_privacy,
+    settings_to_transaction_reminders,
     user_to_dto,
     verification_to_dto,
 )
 
 KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
+
+
+def _valid_avatar_url(url: str) -> bool:
+    trimmed = url.strip()
+    if trimmed.startswith(("file://", "content://")):
+        return False
+    return trimmed.startswith(("http://", "https://", "/uploads/"))
 
 
 class NotificationSettingsUpdate(BaseModel):
@@ -57,10 +74,213 @@ class PrivacySettingsUpdate(BaseModel):
     showWechatBadge: bool | None = None
     personalization: bool | None = None
 
+
+class TransactionReminderSettingsUpdate(BaseModel):
+    payAlerts: bool | None = None
+    shipAlerts: bool | None = None
+    receiveAlerts: bool | None = None
+    disputeAlerts: bool | None = None
+
 router = APIRouter(tags=["users"])
 payments_router = APIRouter(prefix="/payments", tags=["payments"])
 payouts_router = APIRouter(prefix="/payouts", tags=["payouts"])
 settings_router = APIRouter(prefix="/settings", tags=["settings"])
+
+
+@router.get("/users/me/profile", response_model=AuthUserDto)
+def get_profile(user: User = Depends(get_current_user)):
+    return user_to_dto(user)
+
+
+@router.post("/users/me/push-tokens", status_code=204)
+def register_push_token(
+    body: RegisterPushTokenRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": "Push token is required", "details": {}},
+        )
+    existing = db.query(DevicePushToken).filter(DevicePushToken.token == token).first()
+    if existing:
+        existing.user_id = user.id
+        existing.platform = body.platform
+    else:
+        db.add(DevicePushToken(user_id=user.id, token=token, platform=body.platform))
+    db.commit()
+
+
+@router.delete("/users/me/push-tokens", status_code=204)
+def remove_push_token(
+    body: RemovePushTokenRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    token = body.token.strip()
+    if not token:
+        return
+    db.query(DevicePushToken).filter(
+        DevicePushToken.user_id == user.id,
+        DevicePushToken.token == token,
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
+@router.patch("/users/me/profile", response_model=AuthUserDto)
+def update_profile(body: UserProfileUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if body.nickname is not None:
+        user.nickname = body.nickname.strip()
+    if body.bio is not None:
+        user.bio = body.bio
+    if body.city is not None:
+        city = body.city.strip()
+        if city not in KNOWN_CITY_NAMES:
+            raise HTTPException(status_code=400, detail="Invalid city")
+        user.city = city
+    if body.language is not None:
+        user.language = body.language
+    if body.avatarUrl is not None:
+        avatar = body.avatarUrl.strip()
+        if not _valid_avatar_url(avatar):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": "Avatar must be an uploaded http(s) or /uploads/ URL",
+                    "details": {},
+                },
+            )
+        user.avatar_url = avatar
+    db.commit()
+    db.refresh(user)
+    return user_to_dto(user)
+
+
+@router.get("/users/me/addresses", response_model=list[AddressDto])
+def get_addresses(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    addrs = db.query(Address).filter(Address.user_id == user.id).all()
+    return [address_to_dto(a) for a in addrs]
+
+
+@router.post("/users/me/addresses", response_model=AddressDto, status_code=201)
+def add_address(body: AddressCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    count = db.query(Address).filter(Address.user_id == user.id).count()
+    addr = Address(
+        user_id=user.id,
+        label=body.label,
+        area=body.area,
+        meetup_spot=body.meetupSpot,
+        is_default=body.isDefault if body.isDefault is not None else count == 0,
+    )
+    if addr.is_default:
+        db.query(Address).filter(Address.user_id == user.id).update({"is_default": False})
+    db.add(addr)
+    db.commit()
+    db.refresh(addr)
+    return address_to_dto(addr)
+
+
+@router.patch("/users/me/addresses/{address_id}", response_model=AddressDto)
+def update_address(
+    address_id: str,
+    body: AddressUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    addr = db.query(Address).filter(Address.id == address_id, Address.user_id == user.id).first()
+    if not addr:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Address not found", "details": {}})
+    if body.label is not None:
+        addr.label = body.label
+    if body.area is not None:
+        addr.area = body.area
+    if body.meetupSpot is not None:
+        addr.meetup_spot = body.meetupSpot
+    if body.isDefault:
+        db.query(Address).filter(Address.user_id == user.id).update({"is_default": False})
+        addr.is_default = True
+    db.commit()
+    db.refresh(addr)
+    return address_to_dto(addr)
+
+
+@router.delete("/users/me/addresses/{address_id}", status_code=204)
+def delete_address(address_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    addr = db.query(Address).filter(Address.id == address_id, Address.user_id == user.id).first()
+    if addr:
+        db.delete(addr)
+        db.commit()
+    return Response(status_code=204)
+
+
+def _received_avg_rating(db: Session, user_id: str) -> float:
+    row = (
+        db.query(func.avg(Review.rating), func.count(Review.id))
+        .join(Order, Review.order_id == Order.id)
+        .filter(Order.seller_id == user_id)
+        .one()
+    )
+    count = int(row[1] or 0)
+    if count == 0:
+        return 0.0
+    return float(row[0] or 0.0)
+
+
+def _completion_rate(db: Session, user_id: str) -> float:
+    terminal = ("completed", "pendingReview", "cancelled")
+    base = db.query(Order).filter(
+        or_(Order.buyer_id == user_id, Order.seller_id == user_id),
+        Order.status.in_(terminal),
+    )
+    total = base.count()
+    if total == 0:
+        return 100.0
+    successful = base.filter(Order.status.in_(("completed", "pendingReview"))).count()
+    return round(100.0 * successful / total, 1)
+
+
+@router.get("/users/me/credit", response_model=CreditProfileDto)
+def get_credit(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    completed = db.query(Order).filter(Order.buyer_id == user.id, Order.status == "completed").count()
+    return credit_profile(
+        user.id,
+        completed,
+        _received_avg_rating(db, user.id),
+        _completion_rate(db, user.id),
+    )
+
+
+@router.get("/users/me/reviews/summary", response_model=ReviewSummaryDto)
+def get_review_summary(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pending = db.query(Order).filter(Order.buyer_id == user.id, Order.status == "pendingReview").count()
+    return review_summary(_received_avg_rating(db, user.id), pending)
+
+
+@router.get("/users/me/verification", response_model=VerificationStatusDto)
+def get_verification(user: User = Depends(get_current_user)):
+    return verification_to_dto(user)
+
+
+@router.post("/users/me/verification/bind", response_model=VerificationStatusDto)
+def bind_verification(
+    body: BindVerificationRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if body.type == "wechat":
+        user.wechat_bound = True
+    elif body.type == "alipay":
+        user.alipay_bound = True
+    elif body.type == "identity":
+        user.identity_verified = True
+    elif body.type == "business":
+        user.business_verified = True
+    db.commit()
+    db.refresh(user)
+    return verification_to_dto(user)
 
 
 @router.get("/users/{user_id}/profile", response_model=PublicUserProfileDto)
@@ -78,7 +298,7 @@ def get_public_profile(user_id: str, request: Request, db: Session = Depends(get
         .filter(Order.seller_id == user.id)
         .one()
     )
-    avg_rating = float(review_row[0] or 5.0)
+    avg_rating = float(review_row[0] or 0.0) if int(review_row[1] or 0) > 0 else 0.0
     review_count = int(review_row[1] or 0)
     listing_count = (
         db.query(Listing).filter(Listing.seller_id == user.id, Listing.status == "active").count()
@@ -122,107 +342,6 @@ def get_public_listings(
     return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
 
 
-@router.get("/users/me/profile", response_model=AuthUserDto)
-def get_profile(user: User = Depends(get_current_user)):
-    return user_to_dto(user)
-
-
-@router.patch("/users/me/profile", response_model=AuthUserDto)
-def update_profile(body: UserProfileUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if body.nickname is not None:
-        user.nickname = body.nickname.strip()
-    if body.bio is not None:
-        user.bio = body.bio
-    if body.city is not None:
-        city = body.city.strip()
-        if city not in KNOWN_CITY_NAMES:
-            raise HTTPException(status_code=400, detail="Invalid city")
-        user.city = city
-    if body.language is not None:
-        user.language = body.language
-    if body.avatarUrl is not None:
-        user.avatar_url = body.avatarUrl
-    db.commit()
-    db.refresh(user)
-    return user_to_dto(user)
-
-
-@router.get("/users/me/addresses", response_model=list[AddressDto])
-def get_addresses(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    addrs = db.query(Address).filter(Address.user_id == user.id).all()
-    return [address_to_dto(a) for a in addrs]
-
-
-@router.post("/users/me/addresses", response_model=AddressDto, status_code=201)
-def add_address(body: AddressCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    count = db.query(Address).filter(Address.user_id == user.id).count()
-    addr = Address(
-        user_id=user.id,
-        label=body.label,
-        area=body.area,
-        meetup_spot=body.meetupSpot,
-        is_default=body.isDefault if body.isDefault is not None else count == 0,
-    )
-    if addr.is_default:
-        db.query(Address).filter(Address.user_id == user.id).update({"is_default": False})
-    db.add(addr)
-    db.commit()
-    db.refresh(addr)
-    return address_to_dto(addr)
-
-
-@router.patch("/users/me/addresses/{address_id}", response_model=AddressDto)
-def update_address(
-    address_id: str,
-    body: AddressCreateRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    addr = db.query(Address).filter(Address.id == address_id, Address.user_id == user.id).first()
-    if not addr:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Address not found", "details": {}})
-    if body.label is not None:
-        addr.label = body.label
-    if body.area is not None:
-        addr.area = body.area
-    if body.meetupSpot is not None:
-        addr.meetup_spot = body.meetupSpot
-    if body.isDefault:
-        db.query(Address).filter(Address.user_id == user.id).update({"is_default": False})
-        addr.is_default = True
-    db.commit()
-    db.refresh(addr)
-    return address_to_dto(addr)
-
-
-@router.delete("/users/me/addresses/{address_id}", status_code=204)
-def delete_address(address_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    addr = db.query(Address).filter(Address.id == address_id, Address.user_id == user.id).first()
-    if addr:
-        db.delete(addr)
-        db.commit()
-    return Response(status_code=204)
-
-
-@router.get("/users/me/credit", response_model=CreditProfileDto)
-def get_credit(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    completed = db.query(Order).filter(Order.buyer_id == user.id, Order.status == "completed").count()
-    avg_rating = db.query(func.avg(Review.rating)).filter(Review.reviewer_id == user.id).scalar() or 5.0
-    return credit_profile(user.id, completed, float(avg_rating))
-
-
-@router.get("/users/me/reviews/summary", response_model=ReviewSummaryDto)
-def get_review_summary(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    pending = db.query(Order).filter(Order.buyer_id == user.id, Order.status == "pendingReview").count()
-    avg_rating = db.query(func.avg(Review.rating)).filter(Review.reviewer_id == user.id).scalar() or 5.0
-    return review_summary(float(avg_rating), pending)
-
-
-@router.get("/users/me/verification", response_model=VerificationStatusDto)
-def get_verification(user: User = Depends(get_current_user)):
-    return verification_to_dto(user)
-
-
 @payments_router.get("/methods", response_model=list[PaymentMethodDto])
 def list_payment_methods(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     methods = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()
@@ -247,6 +366,40 @@ def add_payment_method(body: AddPaymentMethodRequest, user: User = Depends(get_c
     return payment_to_dto(pm)
 
 
+@payments_router.delete("/methods/{method_id}", status_code=204)
+def remove_payment_method(
+    method_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    pm = db.query(PaymentMethod).filter(PaymentMethod.id == method_id, PaymentMethod.user_id == user.id).first()
+    if not pm:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payment method not found", "details": {}})
+    db.delete(pm)
+    db.commit()
+    return Response(status_code=204)
+
+
+@payments_router.patch("/methods/{method_id}", response_model=PaymentMethodDto)
+def set_default_payment_method(
+    method_id: str,
+    body: SetDefaultMethodRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    pm = db.query(PaymentMethod).filter(PaymentMethod.id == method_id, PaymentMethod.user_id == user.id).first()
+    if not pm:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payment method not found", "details": {}})
+    if body.isDefault:
+        for method in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all():
+            method.is_default = method.id == method_id
+    else:
+        pm.is_default = False
+    db.commit()
+    db.refresh(pm)
+    return payment_to_dto(pm)
+
+
 @payouts_router.get("/methods", response_model=list[PayoutMethodDto])
 def list_payout_methods(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     methods = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).all()
@@ -266,6 +419,51 @@ def add_payout_method(body: AddPayoutMethodRequest, user: User = Depends(get_cur
         is_default=count == 0,
     )
     db.add(pm)
+    db.commit()
+    db.refresh(pm)
+    return payout_to_dto(pm)
+
+
+@payouts_router.delete("/methods/{method_id}", status_code=204)
+def remove_payout_method(
+    method_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    pm = db.query(PayoutMethod).filter(PayoutMethod.id == method_id, PayoutMethod.user_id == user.id).first()
+    if not pm:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payout method not found", "details": {}})
+    was_default = pm.is_default
+    db.delete(pm)
+    db.commit()
+    if was_default:
+        remaining = (
+            db.query(PayoutMethod)
+            .filter(PayoutMethod.user_id == user.id)
+            .order_by(PayoutMethod.id.asc())
+            .first()
+        )
+        if remaining:
+            remaining.is_default = True
+            db.commit()
+    return Response(status_code=204)
+
+
+@payouts_router.patch("/methods/{method_id}", response_model=PayoutMethodDto)
+def set_default_payout_method(
+    method_id: str,
+    body: SetDefaultMethodRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    pm = db.query(PayoutMethod).filter(PayoutMethod.id == method_id, PayoutMethod.user_id == user.id).first()
+    if not pm:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payout method not found", "details": {}})
+    if body.isDefault:
+        for method in db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).all():
+            method.is_default = method.id == method_id
+    else:
+        pm.is_default = False
     db.commit()
     db.refresh(pm)
     return payout_to_dto(pm)
@@ -326,6 +524,55 @@ def update_privacy_settings(
     return settings_to_privacy(s)
 
 
+@settings_router.get("/transaction-reminders", response_model=TransactionReminderSettingsDto)
+def get_transaction_reminder_settings(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    s = get_or_create_settings(db, user.id)
+    return settings_to_transaction_reminders(s)
+
+
+@settings_router.patch("/transaction-reminders", response_model=TransactionReminderSettingsDto)
+def update_transaction_reminder_settings(
+    body: TransactionReminderSettingsUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    s = get_or_create_settings(db, user.id)
+    data = body.model_dump(exclude_unset=True)
+    mapping = {
+        "payAlerts": "remind_pay",
+        "shipAlerts": "remind_ship",
+        "receiveAlerts": "remind_receive",
+        "disputeAlerts": "remind_dispute",
+    }
+    for k, v in data.items():
+        if k in mapping:
+            setattr(s, mapping[k], v)
+    db.commit()
+    db.refresh(s)
+    return settings_to_transaction_reminders(s)
+
+
 @settings_router.post("/cache/clear", response_model=CacheClearResponse)
-def clear_cache(user: User = Depends(get_current_user)):
-    return CacheClearResponse(freedBytes=0)
+def clear_cache(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = (
+        db.query(ViewHistory)
+        .filter(ViewHistory.user_id == user.id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return CacheClearResponse(freedBytes=max(rows, 0) * 256)
+
+
+@settings_router.get("/data-export", response_model=DataExportDto)
+def export_user_data(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    settings_row = get_or_create_settings(db, user.id)
+    addresses = db.query(Address).filter(Address.user_id == user.id).order_by(Address.id.asc()).all()
+    return DataExportDto(
+        exportedAt=datetime.now(timezone.utc).isoformat(),
+        profile=user_to_dto(user),
+        notificationSettings=settings_to_notification(settings_row),
+        privacySettings=settings_to_privacy(settings_row),
+        transactionReminderSettings=settings_to_transaction_reminders(settings_row),
+        addresses=[address_to_dto(a) for a in addresses],
+        verification=verification_to_dto(user),
+    )

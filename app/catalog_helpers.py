@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import or_
 from sqlalchemy.orm import Query, Session
 
-from app.models import Listing
+from app.models import Listing, Order
+
+PENDING_PAY_STATUS = "pendingPay"
 
 OTHER_AREAS = "其他地区"
 ALL_AREAS = "全部区域"
@@ -74,10 +76,21 @@ def apply_tab_filter(q: Query, tab: str | None) -> Query:
     return q
 
 
+def exclude_unpaid_reserved(q: Query, db: Session) -> Query:
+    """Hide listings with an unpaid order so catalog matches reservation rules."""
+    reserved_ids = (
+        db.query(Order.listing_id)
+        .filter(Order.status == PENDING_PAY_STATUS)
+        .distinct()
+        .subquery()
+    )
+    return q.filter(~Listing.id.in_(db.query(reserved_ids.c.listing_id)))
+
+
 def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
     if q_text:
         pattern = f"%{q_text.strip()}%"
-        q = q.filter(or_(Listing.title.ilike(pattern), Listing.description.ilike(pattern), Listing.title_zh.ilike(pattern)))
+        q = q.filter(or_(Listing.title.ilike(pattern), Listing.description.ilike(pattern), Listing.title_zh.ilike(pattern), Listing.description_zh.ilike(pattern)))
     if sort == "priceAsc":
         q = q.order_by(Listing.price.asc())
     elif sort == "priceDesc":
@@ -89,6 +102,175 @@ def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
     else:
         q = q.order_by(Listing.created_at.desc())
     return q
+
+
+def listing_checkout_amount(listing: Listing) -> float:
+    """Checkout price; bundle listings exclude shares of sold items."""
+    if listing.type == "bundle" and isinstance(listing.bundle_meta, dict):
+        meta = listing.bundle_meta
+        try:
+            full_price = float(meta.get("fullPrice", listing.price))
+        except (TypeError, ValueError):
+            full_price = float(listing.price)
+        sold_share = 0.0
+        for item in meta.get("items") or []:
+            if isinstance(item, dict) and item.get("status") in ("sold", "onHold"):
+                try:
+                    sold_share += float(item.get("sharePrice") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return max(full_price - sold_share, 0.0)
+    return float(listing.price)
+
+
+def reset_bundle_meta_for_resale(raw: dict | None) -> dict | None:
+    if not raw or not isinstance(raw, dict):
+        return None
+    meta = dict(raw)
+    items = []
+    for item in meta.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row["status"] = "available"
+        items.append(row)
+    meta["items"] = items
+    return meta
+
+
+def apply_bundle_payment(listing: Listing) -> None:
+    """Mark bundle items sold after full remaining-bundle payment."""
+    if listing.type != "bundle" or not isinstance(listing.bundle_meta, dict):
+        listing.status = "sold"
+        return
+    meta = dict(listing.bundle_meta)
+    items = []
+    for item in meta.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        if row.get("status") != "sold":
+            row["status"] = "sold"
+        items.append(row)
+    meta["items"] = items
+    listing.bundle_meta = meta
+    listing.status = "sold"
+
+
+def find_bundle_item(listing: Listing, bundle_item_id: str) -> dict | None:
+    if listing.type != "bundle" or not isinstance(listing.bundle_meta, dict):
+        return None
+    for item in listing.bundle_meta.get("items") or []:
+        if isinstance(item, dict) and item.get("id") == bundle_item_id:
+            return item
+    return None
+
+
+def bundle_allows_separate_sale(listing: Listing) -> bool:
+    if listing.type != "bundle" or not isinstance(listing.bundle_meta, dict):
+        return False
+    return listing.bundle_meta.get("allowSeparateSale", True) is not False
+
+
+def bundle_item_separate_price(item: dict) -> float:
+    try:
+        val = float(item.get("separatePrice") or 0)
+    except (TypeError, ValueError):
+        val = 0.0
+    return val if val > 0 else 0.0
+
+
+def bundle_item_is_available(item: dict) -> bool:
+    return item.get("status", "available") == "available"
+
+
+def _write_bundle_meta_items(listing: Listing, items: list) -> None:
+    meta = dict(listing.bundle_meta) if isinstance(listing.bundle_meta, dict) else {}
+    meta["items"] = items
+    listing.bundle_meta = meta
+
+
+def set_bundle_item_status(listing: Listing, bundle_item_id: str, status: str) -> bool:
+    if not isinstance(listing.bundle_meta, dict):
+        return False
+    items = []
+    found = False
+    for item in listing.bundle_meta.get("items") or []:
+        if not isinstance(item, dict):
+            items.append(item)
+            continue
+        row = dict(item)
+        if row.get("id") == bundle_item_id:
+            row["status"] = status
+            found = True
+        items.append(row)
+    if not found:
+        return False
+    _write_bundle_meta_items(listing, items)
+    return True
+
+
+def all_bundle_items_sold(listing: Listing) -> bool:
+    if not isinstance(listing.bundle_meta, dict):
+        return True
+    items = listing.bundle_meta.get("items") or []
+    if not items:
+        return True
+    return all(isinstance(item, dict) and item.get("status") == "sold" for item in items)
+
+
+def apply_bundle_item_payment(listing: Listing, bundle_item_id: str) -> None:
+    set_bundle_item_status(listing, bundle_item_id, "sold")
+    if all_bundle_items_sold(listing):
+        listing.status = "sold"
+
+
+def release_bundle_item_hold(listing: Listing, bundle_item_id: str) -> None:
+    item = find_bundle_item(listing, bundle_item_id)
+    if item and item.get("status") == "onHold":
+        set_bundle_item_status(listing, bundle_item_id, "available")
+
+
+def release_order_bundle_hold(db: Session, order: Order) -> None:
+    if not order.bundle_item_id:
+        return
+    listing = db.query(Listing).filter(Listing.id == order.listing_id).first()
+    if listing:
+        release_bundle_item_hold(listing, order.bundle_item_id)
+
+
+def expire_stale_pending_pay_orders(db: Session, ttl_minutes: int = 30) -> None:
+    """Cancel unpaid orders past TTL so listings are released back to catalog."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
+    stale = (
+        db.query(Order)
+        .filter(Order.status == PENDING_PAY_STATUS, Order.created_at < cutoff)
+        .all()
+    )
+    if not stale:
+        return
+    now = datetime.now(timezone.utc)
+    for order in stale:
+        release_order_bundle_hold(db, order)
+        order.status = "cancelled"
+        order.updated_at = now
+    db.commit()
+
+
+def listing_has_pending_pay(db: Session, listing_id: int) -> bool:
+    return (
+        db.query(Order.id)
+        .filter(Order.listing_id == listing_id, Order.status == PENDING_PAY_STATUS)
+        .first()
+        is not None
+    )
+
+
+def compute_purchase_available(db: Session, listing: Listing) -> bool:
+    checkout_amount = listing_checkout_amount(listing)
+    if listing.status != "active" or checkout_amount <= 0:
+        return False
+    return not listing_has_pending_pay(db, listing.id)
 
 
 def get_or_create_settings(db: Session, user_id: str):

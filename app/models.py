@@ -23,6 +23,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(dt: datetime) -> datetime:
+    """Normalize DB datetimes to UTC-aware (SQLite returns naive values)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def new_uuid() -> str:
     return str(uuid.uuid4())
 
@@ -63,6 +70,21 @@ class RefreshToken(Base):
     user: Mapped[User] = relationship(back_populates="refresh_tokens")
 
 
+class PhoneOtp(Base):
+    __tablename__ = "phone_otps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    phone: Mapped[str] = mapped_column(String(20), index=True)
+    purpose: Mapped[str] = mapped_column(String(20), default="register")
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("phone", "purpose", name="uq_phone_otp_purpose"),)
+
+
 class Listing(Base):
     __tablename__ = "listings"
 
@@ -86,6 +108,7 @@ class Listing(Base):
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     negotiable: Mapped[bool] = mapped_column(Boolean, default=False)
     escrow_supported: Mapped[bool] = mapped_column(Boolean, default=True)
+    meet_in_public: Mapped[bool] = mapped_column(Boolean, default=True)
     pickup_methods_json: Mapped[str] = mapped_column(Text, default='["meetup"]')
     bundle_meta_json: Mapped[str] = mapped_column(Text, default="{}")
     service_icon: Mapped[str | None] = mapped_column(String(30), nullable=True)
@@ -144,6 +167,9 @@ class Order(Base):
     escrow_fee: Mapped[float] = mapped_column(Float, default=0.99)
     delivery_method: Mapped[str] = mapped_column(String(50), default="meetup")
     payment_method_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    bundle_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    coupon_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    discount_amount: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -189,6 +215,7 @@ class Coupon(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     amount: Mapped[float] = mapped_column(Float)
     description: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="available")
 
@@ -204,6 +231,10 @@ class Conversation(Base):
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     buyer_unread: Mapped[int] = mapped_column(Integer, default=0)
     seller_unread: Mapped[int] = mapped_column(Integer, default=0)
+    buyer_read_inbox_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    seller_read_inbox_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    buyer_marked_unread: Mapped[bool] = mapped_column(Boolean, default=False)
+    seller_marked_unread: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     listing: Mapped[Listing] = relationship()
@@ -265,9 +296,23 @@ class UserSettings(Base):
     chat_messages: Mapped[bool] = mapped_column(Boolean, default=True)
     review_results: Mapped[bool] = mapped_column(Boolean, default=True)
     marketing: Mapped[bool] = mapped_column(Boolean, default=False)
+    remind_pay: Mapped[bool] = mapped_column(Boolean, default=True)
+    remind_ship: Mapped[bool] = mapped_column(Boolean, default=True)
+    remind_receive: Mapped[bool] = mapped_column(Boolean, default=True)
+    remind_dispute: Mapped[bool] = mapped_column(Boolean, default=True)
     find_by_phone: Mapped[bool] = mapped_column(Boolean, default=True)
     show_wechat_badge: Mapped[bool] = mapped_column(Boolean, default=False)
     personalization: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    platform: Mapped[str] = mapped_column(String(20))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class SafetyReport(Base):

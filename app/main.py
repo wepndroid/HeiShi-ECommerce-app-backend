@@ -11,6 +11,8 @@ from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.routers import auth, catalog, listings, messages, orders, region_safety, user_data, users
 from app.migrations import run_migrations
+from app.conversation_inbox import cleanup_duplicate_empty_conversations
+from app.messaging_read import backfill_read_watermarks
 from app.seed import seed
 
 
@@ -20,6 +22,8 @@ async def lifespan(_app: FastAPI):
     run_migrations(engine)
     db = SessionLocal()
     try:
+        backfill_read_watermarks(db)
+        cleanup_duplicate_empty_conversations(db)
         seed(db)
     finally:
         db.close()
@@ -40,6 +44,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def private_network_access(request: Request, call_next):
+    """Chrome blocks localhost → 127.0.0.1 unless preflight allows private network."""
+    response = await call_next(request)
+    if (
+        request.method == "OPTIONS"
+        and request.headers.get("access-control-request-private-network") == "true"
+    ):
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 upload_path = Path(settings.upload_dir)
 upload_path.mkdir(parents=True, exist_ok=True)

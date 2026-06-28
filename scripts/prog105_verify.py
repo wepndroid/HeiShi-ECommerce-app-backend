@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -14,6 +15,10 @@ UUID_RE = re.compile(
 )
 
 results: list[tuple[str, bool, str]] = []
+
+
+def fresh_phone(prefix: str = "04") -> str:
+    return f"{prefix}{int(time.time() * 1000) % 100000000:08d}"
 
 
 def record(name: str, passed: bool, detail: str = "") -> None:
@@ -97,7 +102,7 @@ def main() -> int:
     status, data = request(
         "POST",
         "/auth/register",
-        {"nickname": "Bad", "phone": "123", "password": "secret1"},
+        {"nickname": "Bad", "phone": "123", "password": "secret1", "verificationCode": "123456"},
     )
     record(
         "Invalid register phone -> VALIDATION_ERROR",
@@ -105,11 +110,25 @@ def main() -> int:
         str(data),
     )
 
+    # Register — missing OTP
+    otp_phone = fresh_phone("04")
+    request("POST", "/auth/register/send-code", {"phone": otp_phone})
+    status, data = request(
+        "POST",
+        "/auth/register",
+        {"nickname": "NoOtp", "phone": otp_phone, "password": "secret1", "verificationCode": "000000"},
+    )
+    record(
+        "Register without valid OTP -> OTP_INVALID",
+        status == 400 and data and data.get("code") == "OTP_INVALID",
+        str(data),
+    )
+
     # Register — duplicate
     status, data = request(
         "POST",
         "/auth/register",
-        {"nickname": "Dup", "phone": "0400000000", "password": "secret1"},
+        {"nickname": "Dup", "phone": "0400000000", "password": "secret1", "verificationCode": "123456"},
     )
     record(
         "Duplicate register -> PHONE_TAKEN",
@@ -117,12 +136,30 @@ def main() -> int:
         str(data),
     )
 
-    # Register — fresh user
-    test_phone = "0488877766"
+    # Register — fresh user with OTP
+    test_phone = fresh_phone("04")
+    status, send_data = request("POST", "/auth/register/send-code", {"phone": test_phone})
+    dev_code = send_data.get("devCode") if isinstance(send_data, dict) else None
+    record("Send register code", status == 200 and bool(dev_code), str(dev_code or status))
+
+    status_resend, resend_data = request("POST", "/auth/register/send-code", {"phone": test_phone})
+    record(
+        "Resend within cooldown -> OTP_RATE_LIMIT",
+        status_resend == 429
+        and isinstance(resend_data, dict)
+        and resend_data.get("code") == "OTP_RATE_LIMIT",
+        str(resend_data),
+    )
+
     status, data = request(
         "POST",
         "/auth/register",
-        {"nickname": "Prog105User", "phone": test_phone, "password": "secret1"},
+        {
+            "nickname": "Prog105User",
+            "phone": test_phone,
+            "password": "secret1",
+            "verificationCode": dev_code or "000000",
+        },
     )
     if status == 409:
         # reuse existing from prior run
@@ -180,15 +217,21 @@ def main() -> int:
         )
 
     # heishiId collision path
+    coll_a = fresh_phone("04")
+    coll_b = fresh_phone("05")
+    status, send_a = request("POST", "/auth/register/send-code", {"phone": coll_a})
+    code_a = send_a.get("devCode") if isinstance(send_a, dict) else "000000"
     status, a = request(
         "POST",
         "/auth/register",
-        {"nickname": "CollA", "phone": "0411223344", "password": "secret1"},
+        {"nickname": "CollA", "phone": coll_a, "password": "secret1", "verificationCode": code_a},
     )
+    status, send_b = request("POST", "/auth/register/send-code", {"phone": coll_b})
+    code_b = send_b.get("devCode") if isinstance(send_b, dict) else "000000"
     status, b = request(
         "POST",
         "/auth/register",
-        {"nickname": "CollB", "phone": "0511223344", "password": "secret1"},
+        {"nickname": "CollB", "phone": coll_b, "password": "secret1", "verificationCode": code_b},
     )
     if a and a.get("user") and b and b.get("user"):
         ha = a["user"]["heishiId"]
