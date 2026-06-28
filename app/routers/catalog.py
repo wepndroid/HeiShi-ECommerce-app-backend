@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_accept_language, get_current_user_optional
 from app.blocklist_helpers import exclude_blocked_sellers, users_blocked
 from app.catalog_helpers import (
+    apply_feed_listing_status_filter,
     apply_region_filter,
     apply_search,
     apply_tab_filter,
@@ -91,8 +92,10 @@ def get_feed(
 ):
     lang = get_accept_language(request)
     expire_stale_pending_pay_orders(db, settings.pending_pay_expire_minutes)
-    q = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.status == "active")
-    q = exclude_unpaid_reserved(q, db)
+    viewer_id = user.id if user else None
+    q = db.query(Listing).options(joinedload(Listing.seller))
+    q = apply_feed_listing_status_filter(q, db, viewer_id)
+    q = exclude_unpaid_reserved(q, db, viewer_id)
     q = exclude_blocked_sellers(q, db, user.id if user else None)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
     q = apply_tab_filter(q, tab)
@@ -132,8 +135,10 @@ async def search_by_image(
             detail={"code": "INVALID_IMAGE", "message": "Unsupported image format", "details": {}},
         )
 
-    q = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.status == "active")
-    q = exclude_unpaid_reserved(q, db)
+    q = db.query(Listing).options(joinedload(Listing.seller))
+    viewer_id = user.id if user else None
+    q = apply_feed_listing_status_filter(q, db, viewer_id)
+    q = exclude_unpaid_reserved(q, db, viewer_id)
     q = exclude_blocked_sellers(q, db, user.id if user else None)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
     listings = q.all()
@@ -197,8 +202,10 @@ def search(
     user: User | None = Depends(get_current_user_optional),
 ):
     lang = get_accept_language(request)
-    query = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.status == "active")
-    query = exclude_unpaid_reserved(query, db)
+    viewer_id = user.id if user else None
+    query = db.query(Listing).options(joinedload(Listing.seller))
+    query = apply_feed_listing_status_filter(query, db, viewer_id)
+    query = exclude_unpaid_reserved(query, db, viewer_id)
     query = exclude_blocked_sellers(query, db, user.id if user else None)
     query = apply_region_filter(query, regionState, regionCity, regionArea)
     query = apply_tab_filter(query, tab)
@@ -250,9 +257,11 @@ def get_related(
     q = (
         db.query(Listing)
         .options(joinedload(Listing.seller))
-        .filter(Listing.status == "active", Listing.id != listing_id, Listing.category_key == source.category_key)
+        .filter(Listing.id != listing_id, Listing.category_key == source.category_key)
     )
-    q = exclude_unpaid_reserved(q, db)
+    viewer_id = user.id if user else None
+    q = apply_feed_listing_status_filter(q, db, viewer_id)
+    q = exclude_unpaid_reserved(q, db, viewer_id)
     q = exclude_blocked_sellers(q, db, user.id if user else None)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
     q = q.order_by(Listing.created_at.desc())
@@ -270,14 +279,13 @@ def get_services(
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_current_user_optional),
 ):
     lang = get_accept_language(request)
-    q = (
-        db.query(Listing)
-        .options(joinedload(Listing.seller))
-        .filter(Listing.status == "active", Listing.type == "service")
-    )
-    q = exclude_unpaid_reserved(q, db)
+    viewer_id = user.id if user else None
+    q = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.type == "service")
+    q = apply_feed_listing_status_filter(q, db, viewer_id)
+    q = exclude_unpaid_reserved(q, db, viewer_id)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
@@ -291,10 +299,13 @@ def get_suggestions(
     regionCity: str | None = None,
     regionArea: str | None = None,
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_current_user_optional),
 ):
     lang = get_accept_language(request)
-    q = db.query(Listing).filter(Listing.status == "active")
-    q = exclude_unpaid_reserved(q, db)
+    viewer_id = user.id if user else None
+    q = db.query(Listing)
+    q = apply_feed_listing_status_filter(q, db, viewer_id)
+    q = exclude_unpaid_reserved(q, db, viewer_id)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
     q = q.order_by(Listing.view_count.desc()).limit(8)
     results = []

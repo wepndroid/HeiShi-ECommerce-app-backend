@@ -6,6 +6,7 @@ from sqlalchemy.orm import Query, Session
 from app.models import Listing, Order
 
 PENDING_PAY_STATUS = "pendingPay"
+ORDER_FEED_STATUSES = ("pendingShip", "pendingReceive", "pendingReview", "completed")
 
 OTHER_AREAS = "其他地区"
 ALL_AREAS = "全部区域"
@@ -76,15 +77,29 @@ def apply_tab_filter(q: Query, tab: str | None) -> Query:
     return q
 
 
-def exclude_unpaid_reserved(q: Query, db: Session) -> Query:
-    """Hide listings with an unpaid order so catalog matches reservation rules."""
-    reserved_ids = (
-        db.query(Order.listing_id)
-        .filter(Order.status == PENDING_PAY_STATUS)
-        .distinct()
-        .subquery()
-    )
+def exclude_unpaid_reserved(q: Query, db: Session, viewer_user_id: str | None = None) -> Query:
+    """Hide listings reserved by another buyer's unpaid checkout."""
+    reserved = db.query(Order.listing_id).filter(Order.status == PENDING_PAY_STATUS)
+    if viewer_user_id:
+        reserved = reserved.filter(Order.buyer_id != viewer_user_id)
+    reserved_ids = reserved.distinct().subquery()
     return q.filter(~Listing.id.in_(db.query(reserved_ids.c.listing_id)))
+
+
+def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None) -> Query:
+    """Active listings for everyone; also show sold/inactive listings tied to the user's orders."""
+    active = Listing.status == "active"
+    if not user_id:
+        return q.filter(active)
+    linked_listing_ids = (
+        db.query(Order.listing_id)
+        .filter(
+            Order.status.in_(ORDER_FEED_STATUSES),
+            (Order.buyer_id == user_id) | (Order.seller_id == user_id),
+        )
+        .distinct()
+    )
+    return q.filter(or_(active, Listing.id.in_(linked_listing_ids)))
 
 
 def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:

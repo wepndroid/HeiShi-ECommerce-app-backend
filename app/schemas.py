@@ -26,6 +26,7 @@ class RegisterRequest(BaseModel):
     phone: str
     password: str = Field(min_length=6)
     verificationCode: str = Field(min_length=6, max_length=6)
+    city: str = Field(min_length=1, max_length=100)
     avatarUrl: str | None = Field(default=None, min_length=1, max_length=500)
 
 
@@ -49,6 +50,7 @@ class SyncProfileRequest(BaseModel):
 
     nickname: str = Field(min_length=1, max_length=50)
     phone: str | None = None
+    city: str = Field(min_length=1, max_length=100)
     avatarUrl: str = Field(min_length=1, max_length=500)
 
 

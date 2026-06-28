@@ -225,7 +225,6 @@ def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
         pickupMethods=listing.pickup_methods,
         escrowFee=settings.escrow_fee if listing.escrow_supported else 0.0,
         viewCount=listing.view_count,
-        favoriteCount=listing.favorite_count,
         bundleMeta=bundle_meta if bundle_meta else None,
         serviceIcon=listing.service_icon if listing.type == "service" else None,
     )

@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 CHAT_CHANNEL_ID = "chat-messages"
+ORDER_CHANNEL_ID = "order-updates"
 
 
 def _chat_push_title(sender_name: str, lang: str) -> str:
@@ -39,7 +40,7 @@ def send_order_remind_push(
     lang: str = "en",
 ) -> None:
     settings = get_or_create_settings(db, seller_id)
-    if not settings.review_results:
+    if not settings.remind_ship:
         return
 
     rows = db.query(DevicePushToken).filter(DevicePushToken.user_id == seller_id).all()
@@ -63,7 +64,7 @@ def send_order_remind_push(
             "priority": "high",
         }
         if row.platform == "android":
-            payload["channelId"] = CHAT_CHANNEL_ID
+            payload["channelId"] = ORDER_CHANNEL_ID
         messages.append(payload)
 
     try:
@@ -77,6 +78,56 @@ def send_order_remind_push(
                 logger.warning("Expo remind-ship HTTP %s: %s", response.status_code, response.text[:200])
     except Exception as exc:
         logger.warning("Expo remind-ship request failed: %s", exc)
+
+
+def send_order_paid_push(
+    db: Session,
+    *,
+    seller_id: str,
+    buyer_name: str,
+    order_id: int,
+    listing_title: str,
+    lang: str = "en",
+) -> None:
+    settings = get_or_create_settings(db, seller_id)
+    if not settings.remind_pay:
+        return
+
+    rows = db.query(DevicePushToken).filter(DevicePushToken.user_id == seller_id).all()
+    if not rows:
+        return
+
+    title = "新订单" if lang.startswith("zh") else "New order"
+    body = (
+        f"买家 {buyer_name} 已付款：{listing_title[:80]}，请尽快发货"
+        if lang.startswith("zh")
+        else f"{buyer_name} paid for {listing_title[:80]} — please ship"
+    )
+    messages: list[dict] = []
+    for row in rows:
+        payload: dict = {
+            "to": row.token,
+            "title": title,
+            "body": body,
+            "data": {"orderId": order_id, "type": "order", "filter": "pendingShip"},
+            "sound": "default",
+            "priority": "high",
+        }
+        if row.platform == "android":
+            payload["channelId"] = ORDER_CHANNEL_ID
+        messages.append(payload)
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                EXPO_PUSH_URL,
+                json=messages,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+            if response.status_code != 200:
+                logger.warning("Expo order-paid HTTP %s: %s", response.status_code, response.text[:200])
+    except Exception as exc:
+        logger.warning("Expo order-paid request failed: %s", exc)
 
 
 def send_chat_message_push(

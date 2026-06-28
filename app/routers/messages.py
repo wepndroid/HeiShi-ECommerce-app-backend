@@ -289,11 +289,27 @@ def open_conversation(
     listing = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.id == body.listingId).first()
     if not listing:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
-    seller_id = body.counterpartUserId or listing.seller_id
-    if seller_id == user.id:
+    if user.id == listing.seller_id:
+        if not body.counterpartUserId:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": "counterpartUserId is required when opening chat as the listing seller",
+                    "details": {},
+                },
+            )
+        buyer_id = body.counterpartUserId
+        seller_id = user.id
+    else:
+        buyer_id = user.id
+        seller_id = listing.seller_id
+
+    if buyer_id == seller_id:
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Cannot chat with yourself", "details": {}})
-    _ensure_not_blocked(db, user.id, seller_id)
-    buyer_id = user.id
+
+    counterpart_id = buyer_id if user.id == seller_id else seller_id
+    _ensure_not_blocked(db, user.id, counterpart_id)
     existing = find_conversation_for_open(
         db,
         listing_id=body.listingId,
@@ -308,13 +324,10 @@ def open_conversation(
             status_code=400,
             detail={"code": "INVALID_STATE", "message": "Listing is not available for chat", "details": {}},
         )
-    conv = Conversation(listing_id=body.listingId, buyer_id=user.id, seller_id=seller_id)
+    conv = Conversation(listing_id=body.listingId, buyer_id=buyer_id, seller_id=seller_id)
     db.add(conv)
     db.commit()
-    db.refresh(conv)
-    conv.listing = listing
-    conv.buyer = user
-    conv.seller = listing.seller
+    conv = _get_conversation(db, conv.id, user.id)
     return conversation_to_dto(conv, user.id, lang)
 
 

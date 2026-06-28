@@ -22,7 +22,7 @@ from app.coupon_service import refresh_expired_coupons
 from app.database import SessionLocal, get_db
 from app.models import Coupon, Listing, Order, Review, User
 from app.pagination import paginate
-from app.push_notifications import send_order_remind_push
+from app.push_notifications import send_order_paid_push, send_order_remind_push
 from app.schemas import CreateOrderRequest, OrderDto, OrderReviewDto, Paginated, ReviewRequest, UpdateOrderRequest
 from app.serializers import iso, order_to_dto
 
@@ -303,7 +303,13 @@ def update_order(
 
 
 @router.post("/{order_id}/pay", response_model=OrderDto)
-def pay_order(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def pay_order(
+    order_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     order = _get_buyer_order(db, order_id, user.id)
     if order.status != "pendingPay":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending payment", "details": {}})
@@ -342,7 +348,22 @@ def pay_order(order_id: int, request: Request, user: User = Depends(get_current_
             listing.status = "sold"
     db.commit()
     db.refresh(order)
-    return order_to_dto(order, get_accept_language(request))
+    paid_order = (
+        db.query(Order)
+        .options(joinedload(Order.listing), joinedload(Order.buyer))
+        .filter(Order.id == order_id)
+        .first()
+    )
+    if paid_order and paid_order.listing:
+        buyer_name = paid_order.buyer.nickname if paid_order.buyer else "Buyer"
+        background_tasks.add_task(
+            _dispatch_order_paid_push,
+            paid_order.seller_id,
+            buyer_name,
+            paid_order.id,
+            paid_order.listing.title,
+        )
+    return order_to_dto(paid_order or order, get_accept_language(request))
 
 
 @router.post("/{order_id}/ship", response_model=OrderDto)
@@ -355,6 +376,28 @@ def ship_order(order_id: int, request: Request, user: User = Depends(get_current
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request), include_buyer=True)
+
+
+def _dispatch_order_paid_push(
+    seller_id: str,
+    buyer_name: str,
+    order_id: int,
+    listing_title: str,
+) -> None:
+    db = SessionLocal()
+    try:
+        seller = db.query(User).filter(User.id == seller_id).first()
+        lang = seller.language if seller and seller.language else "en"
+        send_order_paid_push(
+            db,
+            seller_id=seller_id,
+            buyer_name=buyer_name,
+            order_id=order_id,
+            listing_title=listing_title,
+            lang=lang,
+        )
+    finally:
+        db.close()
 
 
 def _dispatch_remind_ship_push(

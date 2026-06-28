@@ -44,9 +44,12 @@ from app.schemas import (
 )
 from app.serializers import user_to_dto
 from app.supabase_auth import decode_supabase_jwt, phone_from_claims
+from app.routers.region_safety import REGION_DATA
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 supabase_security = HTTPBearer(auto_error=False)
+
+KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
 
 
 def _valid_avatar_url(url: str) -> bool:
@@ -101,6 +104,7 @@ def sync_profile(
             },
         )
     phone = _require_valid_phone(phone_raw)
+    city = _require_valid_city(body.city)
 
     existing_phone = db.query(User).filter(User.phone == phone, User.id != user_id).first()
     if existing_phone:
@@ -130,7 +134,7 @@ def sync_profile(
             phone=phone,
             password_hash=hash_password(secrets.token_urlsafe(32)),
             heishi_id=generate_heishi_id(db, phone),
-            city="Melbourne",
+            city=city,
             phone_verified=True,
             avatar_url=avatar_url,
         )
@@ -140,6 +144,7 @@ def sync_profile(
     else:
         user.nickname = body.nickname.strip()
         user.phone = phone
+        user.city = city
         user.phone_verified = True
         user.avatar_url = avatar_url
 
@@ -160,6 +165,16 @@ def _require_valid_phone(raw_phone: str) -> str:
     if not is_valid_au_phone(phone):
         raise _validation_error()
     return phone
+
+
+def _require_valid_city(raw_city: str) -> str:
+    city = raw_city.strip()
+    if city not in KNOWN_CITY_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": "Invalid city", "details": {}},
+        )
+    return city
 
 
 def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
@@ -218,6 +233,7 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
 def register(body: RegisterRequest, db: Session = Depends(get_db)):
     """Legacy register — used when Supabase Auth is not configured on the client."""
     phone = _require_valid_phone(body.phone)
+    city = _require_valid_city(body.city)
     if db.query(User).filter(User.phone == phone).first():
         raise HTTPException(
             status_code=409,
@@ -258,7 +274,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
         phone=phone,
         password_hash=hash_password(body.password),
         heishi_id=heishi_id,
-        city="Melbourne",
+        city=city,
         avatar_url=avatar_raw or None,
     )
     db.add(user)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.models import Conversation, Message
@@ -46,18 +47,17 @@ def find_conversation_for_open(
     buyer_id: str,
     seller_id: str,
 ) -> Conversation | None:
-    exact = (
+    return (
         db.query(Conversation)
         .filter(
             Conversation.listing_id == listing_id,
-            Conversation.buyer_id == buyer_id,
-            Conversation.seller_id == seller_id,
+            or_(
+                and_(Conversation.buyer_id == buyer_id, Conversation.seller_id == seller_id),
+                and_(Conversation.buyer_id == seller_id, Conversation.seller_id == buyer_id),
+            ),
         )
         .first()
     )
-    if exact:
-        return exact
-    return None
 
 
 def cleanup_duplicate_empty_conversations(db: Session) -> None:
