@@ -356,10 +356,16 @@ class SystemNotification(Base):
 
 class Review(Base):
     __tablename__ = "reviews"
+    __table_args__ = (UniqueConstraint("order_id", "reviewer_id", name="uq_reviews_order_reviewer"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), unique=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
     reviewer_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     rating: Mapped[int] = mapped_column(Integer)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quality_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    communication_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expertise_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    professionalism_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hire_again_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

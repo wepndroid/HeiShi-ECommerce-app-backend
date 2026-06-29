@@ -222,14 +222,26 @@ class OrderDto(BaseModel):
     updatedAt: str
 
 
+class ReviewCriteriaDto(BaseModel):
+    """Freelancer.com Leave Feedback criteria (1–5 stars each)."""
+
+    quality: int = Field(ge=1, le=5)
+    communication: int = Field(ge=1, le=5)
+    trustement: int = Field(ge=1, le=5)
+
+
 class ReviewRequest(BaseModel):
-    rating: int = Field(ge=1, le=5)
+    """Legacy `rating` or Freelancer-style `criteria` + required comment."""
+
+    rating: int | None = Field(default=None, ge=1, le=5)
     comment: str | None = None
+    criteria: ReviewCriteriaDto | None = None
 
 
 class OrderReviewDto(BaseModel):
     rating: int
     comment: str | None = None
+    criteria: ReviewCriteriaDto | None = None
     createdAt: str
 
 
@@ -390,6 +402,33 @@ class CreditProfileDto(BaseModel):
 class ReviewSummaryDto(BaseModel):
     score: float
     pendingCount: int
+    receivedCount: int
+    buyerScore: float = 0.0
+    buyerReceivedCount: int = 0
+
+
+class PendingReviewOrderDto(BaseModel):
+    orderId: int
+    listingId: int
+    listingTitle: str
+    listingImageUrl: str
+    amount: float
+    counterpartNickname: str
+    reviewRole: Literal["buyer", "seller"]
+
+
+class ReceivedReviewDto(BaseModel):
+    id: str
+    orderId: int
+    rating: int
+    comment: str | None = None
+    criteria: ReviewCriteriaDto | None = None
+    createdAt: str
+    listingTitle: str
+    listingImageUrl: str
+    listingId: int
+    reviewerNickname: str
+    reviewerRole: Literal["buyer", "seller"]
 
 
 class VerificationStatusDto(BaseModel):

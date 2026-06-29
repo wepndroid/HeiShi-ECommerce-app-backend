@@ -41,6 +41,9 @@ from app.schemas import (
     PrivacySettingsDto,
     PublicUserProfileDto,
     ReviewSummaryDto,
+    ReceivedReviewDto,
+    PendingReviewOrderDto,
+    ReviewCriteriaDto,
     SellerDto,
     SystemNotificationDto,
     InboxNotificationDto,
@@ -408,8 +411,71 @@ def credit_profile(user_id: str, db_orders: int, rating: float, completion_rate:
     )
 
 
-def review_summary(rating: float, pending: int) -> ReviewSummaryDto:
-    return ReviewSummaryDto(score=rating, pendingCount=pending)
+def review_summary(
+    seller_rating: float,
+    pending: int,
+    seller_received_count: int,
+    *,
+    buyer_rating: float = 0.0,
+    buyer_received_count: int = 0,
+) -> ReviewSummaryDto:
+    return ReviewSummaryDto(
+        score=seller_rating,
+        pendingCount=pending,
+        receivedCount=seller_received_count,
+        buyerScore=buyer_rating,
+        buyerReceivedCount=buyer_received_count,
+    )
+
+
+def _review_criteria_dto(review: Review) -> ReviewCriteriaDto | None:
+    if review.quality_rating is None:
+        return None
+    return ReviewCriteriaDto(
+        quality=review.quality_rating,
+        communication=review.communication_rating or review.quality_rating,
+        trustement=review.expertise_rating or review.quality_rating,
+    )
+
+
+def received_review_to_dto(
+    review: Review,
+    order: Order,
+    listing: Listing,
+    reviewer: User,
+) -> ReceivedReviewDto:
+    reviewer_role = "buyer" if review.reviewer_id == order.buyer_id else "seller"
+    return ReceivedReviewDto(
+        id=review.id,
+        orderId=order.id,
+        rating=review.rating,
+        comment=review.comment,
+        criteria=_review_criteria_dto(review),
+        createdAt=iso(review.created_at),
+        listingTitle=listing.title,
+        listingImageUrl=normalize_media_url(listing.image_url) or "",
+        listingId=listing.id,
+        reviewerNickname=reviewer.nickname,
+        reviewerRole=reviewer_role,
+    )
+
+
+def pending_review_order_to_dto(
+    order: Order,
+    lang: str,
+    *,
+    review_role: str,
+    counterpart_nickname: str,
+) -> PendingReviewOrderDto:
+    return PendingReviewOrderDto(
+        orderId=order.id,
+        listingId=order.listing_id,
+        listingTitle=listing_title(order.listing, lang),
+        listingImageUrl=normalize_media_url(order.listing.image_url) or "",
+        amount=order.amount,
+        counterpartNickname=counterpart_nickname,
+        reviewRole=review_role,
+    )
 
 
 def system_notification_to_dto(n: SystemNotification) -> SystemNotificationDto:

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
@@ -23,12 +24,66 @@ from app.database import SessionLocal, get_db
 from app.models import Coupon, Listing, Order, Review, User
 from app.pagination import paginate
 from app.push_notifications import send_order_paid_push, send_order_remind_push
-from app.schemas import CreateOrderRequest, OrderDto, OrderReviewDto, Paginated, ReviewRequest, UpdateOrderRequest
+from app.schemas import (
+    CreateOrderRequest,
+    OrderDto,
+    OrderReviewDto,
+    Paginated,
+    ReviewCriteriaDto,
+    ReviewRequest,
+    UpdateOrderRequest,
+)
 from app.serializers import iso, order_to_dto
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 OPEN_ORDER_STATUSES = ("pendingPay", "pendingShip", "pendingReceive", "pendingReview")
+
+
+def _criteria_overall_rating(criteria: ReviewCriteriaDto) -> int:
+    values = [
+        criteria.quality,
+        criteria.communication,
+        criteria.trustement,
+    ]
+    return round(sum(values) / len(values))
+
+
+def _review_criteria_from_model(review: Review) -> ReviewCriteriaDto | None:
+    if review.quality_rating is None:
+        return None
+    return ReviewCriteriaDto(
+        quality=review.quality_rating,
+        communication=review.communication_rating or review.quality_rating,
+        trustement=review.expertise_rating or review.quality_rating,
+    )
+
+
+def _resolve_review_payload(body: ReviewRequest) -> tuple[int, ReviewCriteriaDto | None, str | None]:
+    if body.criteria is not None:
+        comment = (body.comment or "").strip()
+        if not comment:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "VALIDATION_ERROR", "message": "Comment is required", "details": {}},
+            )
+        return _criteria_overall_rating(body.criteria), body.criteria, comment
+    if body.rating is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "VALIDATION_ERROR", "message": "criteria or rating is required", "details": {}},
+        )
+    return body.rating, None, body.comment
+
+
+def _order_review_dto(review: Review) -> OrderReviewDto:
+    criteria = _review_criteria_from_model(review)
+    return OrderReviewDto(
+        rating=review.rating,
+        comment=review.comment,
+        criteria=criteria,
+        createdAt=iso(review.created_at),
+    )
 
 
 def _apply_coupon(
@@ -160,15 +215,9 @@ def list_sales(
 
 @router.get("/{order_id}", response_model=OrderDto)
 def get_order(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    order = (
-        db.query(Order)
-        .options(joinedload(Order.listing), joinedload(Order.seller))
-        .filter(Order.id == order_id, Order.buyer_id == user.id)
-        .first()
-    )
-    if not order:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Order not found", "details": {}})
-    return order_to_dto(order, get_accept_language(request))
+    order = _get_participant_order(db, order_id, user.id)
+    include_buyer = order.seller_id == user.id
+    return order_to_dto(order, get_accept_language(request), include_buyer=include_buyer)
 
 
 @router.post("", response_model=OrderDto, status_code=201)
@@ -512,14 +561,18 @@ def get_order_review(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    order = _get_buyer_order(db, order_id, user.id)
-    review = db.query(Review).filter(Review.order_id == order.id).first()
+    order = _get_participant_order(db, order_id, user.id)
+    review = (
+        db.query(Review)
+        .filter(Review.order_id == order.id, Review.reviewer_id == user.id)
+        .first()
+    )
     if not review:
         raise HTTPException(
             status_code=404,
             detail={"code": "NOT_FOUND", "message": "Review not found", "details": {}},
         )
-    return OrderReviewDto(rating=review.rating, comment=review.comment, createdAt=iso(review.created_at))
+    return _order_review_dto(review)
 
 
 @router.post("/{order_id}/review", status_code=204)
@@ -529,19 +582,63 @@ def submit_review(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    order = _get_buyer_order(db, order_id, user.id)
-    if order.status != "pendingReview":
-        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending review", "details": {}})
-    if db.query(Review).filter(Review.order_id == order.id).first():
-        raise HTTPException(status_code=409, detail={"code": "ALREADY_EXISTS", "message": "Review already submitted", "details": {}})
-    db.add(Review(order_id=order.id, reviewer_id=user.id, rating=body.rating, comment=body.comment))
+    order = _get_participant_order(db, order_id, user.id)
+    if order.status not in ("pendingReview", "completed"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Order is not open for review", "details": {}},
+        )
+    if (
+        db.query(Review)
+        .filter(Review.order_id == order.id, Review.reviewer_id == user.id)
+        .first()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ALREADY_EXISTS", "message": "Review already submitted", "details": {}},
+        )
+    rating, criteria, comment = _resolve_review_payload(body)
+    review = Review(
+        order_id=order.id,
+        reviewer_id=user.id,
+        rating=rating,
+        comment=comment,
+    )
+    if criteria is not None:
+        review.quality_rating = criteria.quality
+        review.communication_rating = criteria.communication
+        review.expertise_rating = criteria.trustement
+    db.add(review)
+    db.flush()
+    _maybe_complete_order_after_review(db, order)
+    db.commit()
+    return Response(status_code=204)
+
+
+def _maybe_complete_order_after_review(db: Session, order: Order) -> None:
+    review_count = db.query(Review).filter(Review.order_id == order.id).count()
+    if review_count < 2 or order.status != "pendingReview":
+        return
     order.status = "completed"
     order.updated_at = datetime.now(timezone.utc)
     listing = db.query(Listing).filter(Listing.id == order.listing_id).first()
-    if listing:
+    if listing and listing.status != "sold":
         listing.status = "sold"
-    db.commit()
-    return Response(status_code=204)
+
+
+def _get_participant_order(db: Session, order_id: int, user_id: str) -> Order:
+    order = (
+        db.query(Order)
+        .options(joinedload(Order.listing), joinedload(Order.seller), joinedload(Order.buyer))
+        .filter(
+            Order.id == order_id,
+            or_(Order.buyer_id == user_id, Order.seller_id == user_id),
+        )
+        .first()
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Order not found", "details": {}})
+    return order
 
 
 def _get_buyer_order(db: Session, order_id: int, buyer_id: str) -> Order:

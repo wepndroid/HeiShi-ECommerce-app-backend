@@ -55,7 +55,7 @@ def assert_credit(d: dict) -> bool:
 
 
 def assert_review_summary(d: dict) -> bool:
-    return "score" in d and "pendingCount" in d
+    return "score" in d and "pendingCount" in d and "receivedCount" in d
 
 
 def assert_verification(d: dict) -> bool:

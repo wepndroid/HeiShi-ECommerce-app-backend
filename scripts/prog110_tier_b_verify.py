@@ -155,7 +155,14 @@ def main() -> int:
         status, _ = request(
             "POST",
             f"/orders/{pending_review_id}/review",
-            body={"rating": 5, "comment": "Tier B verify"},
+            body={
+                "criteria": {
+                    "quality": 5,
+                    "communication": 5,
+                    "trustement": 5,
+                },
+                "comment": "Tier B verify",
+            },
             token=token,
         )
         record("B3 POST /orders/:id/review", status == 204, str(status))

@@ -30,6 +30,8 @@ from app.schemas import (
     RegisterPushTokenRequest,
     RemovePushTokenRequest,
     ReviewSummaryDto,
+    ReceivedReviewDto,
+    PendingReviewOrderDto,
     SetDefaultMethodRequest,
     TransactionReminderSettingsDto,
     UserProfileUpdateRequest,
@@ -44,6 +46,8 @@ from app.serializers import (
     payment_to_dto,
     payout_to_dto,
     public_user_profile,
+    received_review_to_dto,
+    pending_review_order_to_dto,
     review_summary,
     settings_to_notification,
     settings_to_privacy,
@@ -216,17 +220,75 @@ def delete_address(address_id: str, user: User = Depends(get_current_user), db: 
     return Response(status_code=204)
 
 
-def _received_avg_rating(db: Session, user_id: str) -> float:
-    row = (
-        db.query(func.avg(Review.rating), func.count(Review.id))
-        .join(Order, Review.order_id == Order.id)
-        .filter(Order.seller_id == user_id)
-        .one()
-    )
+def _received_review_stats(db: Session, user_id: str, *, as_seller: bool) -> tuple[float, int]:
+    q = db.query(func.avg(Review.rating), func.count(Review.id)).join(Order, Review.order_id == Order.id)
+    if as_seller:
+        q = q.filter(Order.seller_id == user_id, Review.reviewer_id == Order.buyer_id)
+    else:
+        q = q.filter(Order.buyer_id == user_id, Review.reviewer_id == Order.seller_id)
+    row = q.one()
     count = int(row[1] or 0)
     if count == 0:
-        return 0.0
-    return float(row[0] or 0.0)
+        return 0.0, 0
+    return float(row[0] or 0.0), count
+
+
+def _received_avg_rating(db: Session, user_id: str) -> float:
+    avg, _ = _received_review_stats(db, user_id, as_seller=True)
+    return avg
+
+
+def _user_reviewed_order(db: Session, order_id: int, user_id: str) -> bool:
+    return (
+        db.query(Review.id)
+        .filter(Review.order_id == order_id, Review.reviewer_id == user_id)
+        .first()
+        is not None
+    )
+
+
+def _pending_review_orders(db: Session, user_id: str, lang: str) -> list[PendingReviewOrderDto]:
+    reviewable_statuses = ("pendingReview", "completed")
+    pending: list[PendingReviewOrderDto] = []
+
+    buyer_orders = (
+        db.query(Order)
+        .options(joinedload(Order.listing), joinedload(Order.seller))
+        .filter(Order.buyer_id == user_id, Order.status.in_(reviewable_statuses))
+        .order_by(Order.updated_at.desc())
+        .all()
+    )
+    for order in buyer_orders:
+        if not _user_reviewed_order(db, order.id, user_id):
+            pending.append(
+                pending_review_order_to_dto(
+                    order,
+                    lang,
+                    review_role="buyer",
+                    counterpart_nickname=order.seller.nickname if order.seller else "",
+                )
+            )
+
+    seller_orders = (
+        db.query(Order)
+        .options(joinedload(Order.listing), joinedload(Order.buyer))
+        .filter(Order.seller_id == user_id, Order.status.in_(reviewable_statuses))
+        .order_by(Order.updated_at.desc())
+        .all()
+    )
+    for order in seller_orders:
+        if not _user_reviewed_order(db, order.id, user_id):
+            pending.append(
+                pending_review_order_to_dto(
+                    order,
+                    lang,
+                    review_role="seller",
+                    counterpart_nickname=order.buyer.nickname if order.buyer else "",
+                )
+            )
+
+    pending.sort(key=lambda row: row.orderId, reverse=True)
+    return pending
 
 
 def _completion_rate(db: Session, user_id: str) -> float:
@@ -254,9 +316,57 @@ def get_credit(user: User = Depends(get_current_user), db: Session = Depends(get
 
 
 @router.get("/users/me/reviews/summary", response_model=ReviewSummaryDto)
-def get_review_summary(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    pending = db.query(Order).filter(Order.buyer_id == user.id, Order.status == "pendingReview").count()
-    return review_summary(_received_avg_rating(db, user.id), pending)
+def get_review_summary(
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    pending_items = _pending_review_orders(db, user.id, lang)
+    seller_avg, seller_received = _received_review_stats(db, user.id, as_seller=True)
+    buyer_avg, buyer_received = _received_review_stats(db, user.id, as_seller=False)
+    return review_summary(
+        seller_avg,
+        len(pending_items),
+        seller_received,
+        buyer_rating=buyer_avg,
+        buyer_received_count=buyer_received,
+    )
+
+
+@router.get("/users/me/reviews/pending", response_model=list[PendingReviewOrderDto])
+def list_pending_reviews(
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    lang = get_accept_language(request)
+    return _pending_review_orders(db, user.id, lang)
+
+
+@router.get("/users/me/reviews/received", response_model=Paginated[ReceivedReviewDto])
+def list_received_reviews(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    role: str = Query("seller", pattern="^(seller|buyer)$"),
+):
+    q = (
+        db.query(Review, Order, Listing, User)
+        .join(Order, Review.order_id == Order.id)
+        .join(Listing, Order.listing_id == Listing.id)
+        .join(User, Review.reviewer_id == User.id)
+    )
+    if role == "seller":
+        q = q.filter(Order.seller_id == user.id, Review.reviewer_id == Order.buyer_id)
+    else:
+        q = q.filter(Order.buyer_id == user.id, Review.reviewer_id == Order.seller_id)
+    q = q.order_by(Review.created_at.desc())
+    total = q.count()
+    rows = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    items = [received_review_to_dto(review, order, listing, reviewer) for review, order, listing, reviewer in rows]
+    return paginate(items, page, pageSize, total)
 
 
 @router.get("/users/me/verification", response_model=VerificationStatusDto)
@@ -295,7 +405,7 @@ def get_public_profile(user_id: str, request: Request, db: Session = Depends(get
     review_row = (
         db.query(func.avg(Review.rating), func.count(Review.id))
         .join(Order, Review.order_id == Order.id)
-        .filter(Order.seller_id == user.id)
+        .filter(Order.seller_id == user.id, Review.reviewer_id == Order.buyer_id)
         .one()
     )
     avg_rating = float(review_row[0] or 0.0) if int(review_row[1] or 0) > 0 else 0.0

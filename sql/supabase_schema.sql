@@ -280,11 +280,12 @@ CREATE INDEX IF NOT EXISTS ix_system_notifications_user_id ON system_notificatio
 
 CREATE TABLE IF NOT EXISTS reviews (
     id          VARCHAR(36) PRIMARY KEY,
-    order_id    INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+    order_id    INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
     reviewer_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     rating      INTEGER NOT NULL,
     comment     TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (order_id, reviewer_id)
 );
 
 -- ============================================================
