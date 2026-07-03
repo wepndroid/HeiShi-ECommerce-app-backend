@@ -18,6 +18,7 @@ from app.auth import (
     validate_refresh_token,
     verify_password,
 )
+from app.analytics import record_daily_active_user
 from app.catalog_helpers import get_or_create_settings
 from app.config import settings
 from app.coupon_service import issue_welcome_coupon
@@ -26,8 +27,10 @@ from app.models import PhoneOtp, User
 from app.phone_verification import (
     OTP_TTL_SECONDS,
     RESEND_COOLDOWN_SECONDS,
+    consume_login_code,
     consume_register_code,
     generate_code,
+    issue_login_code,
     issue_register_code,
     resend_allowed_at,
 )
@@ -35,6 +38,7 @@ from app.schemas import (
     AuthTokensDto,
     AuthUserDto,
     LoginRequest,
+    LoginOtpRequest,
     RefreshRequest,
     RegisterRequest,
     SendRegisterCodeRequest,
@@ -298,6 +302,77 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     return _issue_tokens(db, user)
 
 
+def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
+        )
+    existing = (
+        db.query(PhoneOtp)
+        .filter(PhoneOtp.phone == phone, PhoneOtp.purpose == "login", PhoneOtp.consumed.is_(False))
+        .first()
+    )
+    if existing is not None:
+        allowed_at = resend_allowed_at(existing)
+        now = datetime.now(timezone.utc)
+        if now < allowed_at:
+            wait = int((allowed_at - now).total_seconds())
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "OTP_RATE_LIMIT",
+                    "message": f"Please wait {wait}s before requesting another code",
+                    "details": {"retryAfter": wait},
+                },
+            )
+    code = generate_code()
+    issue_login_code(db, phone, code)
+    print(f"[HeyMarket OTP] login {phone} -> {code}")
+    return SendRegisterCodeResponse(
+        expiresIn=OTP_TTL_SECONDS,
+        resendAfter=RESEND_COOLDOWN_SECONDS,
+        devCode=code if settings.expose_dev_otp else None,
+    )
+
+
+@router.post("/login/send-code", response_model=SendRegisterCodeResponse)
+def send_login_code(body: SendRegisterCodeRequest, db: Session = Depends(get_db)):
+    phone = _require_valid_phone(body.phone)
+    return _send_login_code(db, phone)
+
+
+@router.post("/login/verify", response_model=AuthTokensDto)
+def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
+    phone = _require_valid_phone(body.phone)
+    try:
+        consume_login_code(db, phone, body.verificationCode.strip())
+    except ValueError as exc:
+        reason = str(exc)
+        if reason == "OTP_EXPIRED":
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "OTP_EXPIRED", "message": "Verification code expired", "details": {}},
+            ) from exc
+        if reason == "OTP_TOO_MANY_ATTEMPTS":
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "OTP_TOO_MANY_ATTEMPTS", "message": "Too many invalid attempts", "details": {}},
+            ) from exc
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
+        ) from exc
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
+        )
+    return _issue_tokens(db, user)
+
+
 @router.post("/change-password", status_code=204)
 def change_password(
     body: ChangePasswordRequest,
@@ -348,5 +423,6 @@ def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/me", response_model=AuthUserDto)
-def me(user: User = Depends(get_current_user)):
+def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    record_daily_active_user(db, user.id)
     return user_to_dto(user)

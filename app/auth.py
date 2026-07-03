@@ -19,10 +19,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
 security = HTTPBearer(auto_error=False)
 AU_PHONE_RE = re.compile(r"^(\+?61|0)\d{8,10}$")
+CN_PHONE_RE = re.compile(r"^\+861[3-9]\d{9}$")
 
 
 def normalize_phone(phone: str) -> str:
     cleaned = re.sub(r"\s+", "", phone.strip())
+    if cleaned.startswith("+86"):
+        digits = cleaned[3:]
+        if re.fullmatch(r"1[3-9]\d{9}", digits):
+            return f"+86{digits}"
+        return cleaned
+    if cleaned.startswith("86") and len(cleaned) >= 13:
+        digits = cleaned[2:]
+        if re.fullmatch(r"1[3-9]\d{9}", digits):
+            return f"+86{digits}"
+    if re.fullmatch(r"1[3-9]\d{9}", cleaned):
+        return f"+86{cleaned}"
     if cleaned.startswith("+61"):
         return f"0{cleaned[3:]}"
     if cleaned.startswith("61") and len(cleaned) >= 11:
@@ -30,8 +42,15 @@ def normalize_phone(phone: str) -> str:
     return cleaned
 
 
+def is_valid_phone(phone: str) -> bool:
+    normalized = normalize_phone(phone)
+    if normalized.startswith("+86"):
+        return bool(CN_PHONE_RE.match(normalized))
+    return bool(AU_PHONE_RE.match(normalized))
+
+
 def is_valid_au_phone(phone: str) -> bool:
-    return bool(AU_PHONE_RE.match(normalize_phone(phone)))
+    return is_valid_phone(phone)
 
 
 def generate_heishi_id(db: Session, phone: str) -> str:
@@ -143,6 +162,11 @@ def get_current_user(user: User | None = Depends(get_current_user_optional)) -> 
         raise HTTPException(
             status_code=401,
             detail={"code": "UNAUTHORIZED", "message": "Authentication required", "details": {}},
+        )
+    if user.account_status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "FORBIDDEN", "message": "Account is banned", "details": {}},
         )
     return user
 

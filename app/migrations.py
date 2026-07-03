@@ -6,15 +6,16 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 
-def _sqlite_add_column_if_missing(engine: Engine, table: str, column: str, ddl: str) -> None:
+def _sqlite_add_column_if_missing(engine: Engine, table: str, column: str, ddl: str) -> bool:
     inspector = inspect(engine)
     if table not in inspector.get_table_names():
-        return
+        return False
     existing = {col["name"] for col in inspector.get_columns(table)}
     if column in existing:
-        return
+        return False
     with engine.begin() as conn:
         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+    return True
 
 
 def _sqlite_reviews_table_corrupted(engine: Engine) -> bool:
@@ -186,3 +187,69 @@ def run_migrations(engine: Engine) -> None:
                 "ON conversations (listing_id, buyer_id, seller_id)"
             )
         )
+
+    _sqlite_migrate_mvp_admin(engine)
+
+
+def _sqlite_migrate_mvp_admin(engine: Engine) -> None:
+    """PROG-401: columns for admin, moderation, payments, verification."""
+
+    user_cols = (
+        ("is_admin", "is_admin BOOLEAN DEFAULT 0"),
+        ("account_status", "account_status VARCHAR(20) DEFAULT 'normal'"),
+        ("admin_notes", "admin_notes TEXT"),
+        ("banned_at", "banned_at DATETIME"),
+        ("ban_reason", "ban_reason TEXT"),
+        ("stripe_connect_id", "stripe_connect_id VARCHAR(100)"),
+        ("preferred_display_currency", "preferred_display_currency VARCHAR(3) DEFAULT 'aud'"),
+    )
+    for col, ddl in user_cols:
+        _sqlite_add_column_if_missing(engine, "users", col, ddl)
+
+    review_status_added = _sqlite_add_column_if_missing(
+        engine, "listings", "review_status", "review_status VARCHAR(20) DEFAULT 'pendingReview'"
+    )
+    listing_cols = (
+        ("review_note", "review_note TEXT"),
+        ("reviewed_at", "reviewed_at DATETIME"),
+        ("reviewed_by", "reviewed_by VARCHAR(36)"),
+        ("is_recommended", "is_recommended BOOLEAN DEFAULT 0"),
+        ("is_pinned", "is_pinned BOOLEAN DEFAULT 0"),
+        ("promotion_click_count", "promotion_click_count INTEGER DEFAULT 0"),
+    )
+    for col, ddl in listing_cols:
+        _sqlite_add_column_if_missing(engine, "listings", col, ddl)
+
+    order_cols = (
+        ("payment_method", "payment_method VARCHAR(30)"),
+        ("psp", "psp VARCHAR(20)"),
+        ("payment_status", "payment_status VARCHAR(30)"),
+        ("psp_payment_id", "psp_payment_id VARCHAR(100)"),
+        ("psp_transaction_id", "psp_transaction_id VARCHAR(100)"),
+        ("charge_currency", "charge_currency VARCHAR(3) DEFAULT 'aud'"),
+        ("amount_minor", "amount_minor INTEGER"),
+        ("display_amount_cny", "display_amount_cny FLOAT"),
+        ("payout_paused", "payout_paused BOOLEAN DEFAULT 0"),
+        ("is_abnormal", "is_abnormal BOOLEAN DEFAULT 0"),
+        ("admin_notes", "admin_notes TEXT"),
+        ("dispute_status", "dispute_status VARCHAR(30)"),
+        ("dispute_reason", "dispute_reason TEXT"),
+        ("dispute_evidence_json", "dispute_evidence_json TEXT DEFAULT '[]'"),
+        ("confirmed_at", "confirmed_at DATETIME"),
+        ("auto_confirm_at", "auto_confirm_at DATETIME"),
+    )
+    for col, ddl in order_cols:
+        _sqlite_add_column_if_missing(engine, "orders", col, ddl)
+
+    report_cols = (
+        ("evidence_urls_json", "evidence_urls_json TEXT DEFAULT '[]'"),
+        ("handler_note", "handler_note TEXT"),
+        ("handled_by", "handled_by VARCHAR(36)"),
+        ("handled_at", "handled_at DATETIME"),
+    )
+    for col, ddl in report_cols:
+        _sqlite_add_column_if_missing(engine, "safety_reports", col, ddl)
+
+    if review_status_added:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE listings SET review_status = 'approved'"))

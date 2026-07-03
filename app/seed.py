@@ -6,15 +6,22 @@ from sqlalchemy.orm import Session
 
 from app.avatar_photos import avatar_url_for_user_id
 from app.auth import hash_password, normalize_phone
+from app.config import settings
 from app.coupon_service import issue_referral_coupon, issue_welcome_coupon
+from app.moderation import seed_blocked_keywords
 from app.models import (
     Coupon,
     Listing,
+    Order,
     PaymentMethod,
+    PlatformCategory,
+    PlatformRegion,
+    Review,
     SystemNotification,
     User,
     UserSettings,
 )
+from app.routers.region_safety import REGION_DATA
 
 PRODUCTS = [
     (1, "Edifier W820NB Noise-Cancelling Headphones", "漫步者降噪耳机", 89, "digital", "lightlyUsed", "Clayton", "mia", "Mia_墨尔本"),
@@ -125,16 +132,111 @@ def _loc_zh(label: str) -> str:
     return _AREA_ZH.get(label, label)
 
 
+_PLATFORM_CATEGORIES = [
+    ("product", "digital", "Digital", "数码"),
+    ("product", "home", "Home", "家居"),
+    ("product", "misc", "Misc", "其他"),
+    ("product", "tickets", "Tickets", "票务"),
+    ("service", "services", "Services", "服务"),
+    ("job", "jobs", "Jobs", "招聘"),
+    ("rental", "rentals", "Rentals", "租赁"),
+]
+
+
+def _seed_platform_config(db: Session) -> None:
+    if not db.query(PlatformCategory).first():
+        for idx, (ctype, key, label_en, label_zh) in enumerate(_PLATFORM_CATEGORIES):
+            db.add(
+                PlatformCategory(
+                    type=ctype,
+                    key=key,
+                    label_en=label_en,
+                    label_zh=label_zh,
+                    sort_order=idx,
+                    enabled=True,
+                )
+            )
+    if not db.query(PlatformRegion).first():
+        sort = 0
+        for region in REGION_DATA:
+            for city in region.cities:
+                db.add(
+                    PlatformRegion(
+                        country="AU",
+                        state=region.state,
+                        city=city.name,
+                        area=None,
+                        label_en=city.name,
+                        label_zh=city.cn,
+                        is_default_city=city.name == "Melbourne",
+                        sort_order=sort,
+                        enabled=True,
+                    )
+                )
+                sort += 1
+                for area in city.areas:
+                    db.add(
+                        PlatformRegion(
+                            country="AU",
+                            state=region.state,
+                            city=city.name,
+                            area=area,
+                            label_en=area,
+                            label_zh=area,
+                            is_default_city=False,
+                            sort_order=sort,
+                            enabled=True,
+                        )
+                    )
+                    sort += 1
+    db.flush()
+
+
+def _ensure_admin_user(db: Session) -> None:
+    phone = normalize_phone(settings.admin_seed_phone)
+    admin = db.query(User).filter(User.phone == phone).first()
+    if admin:
+        if not admin.is_admin:
+            admin.is_admin = True
+        return
+    admin_id = "admin-seed"
+    db.add(
+        User(
+            id=admin_id,
+            nickname="Admin",
+            phone=phone,
+            password_hash=hash_password(settings.admin_seed_password),
+            heishi_id="HSADMIN001",
+            city="Melbourne",
+            is_admin=True,
+            phone_verified=True,
+        )
+    )
+    db.flush()
+    db.add(UserSettings(user_id=admin_id))
+
+
+def _sync_demo_review_status(db: Session) -> None:
+    demo_ids = [pid for pid, *_ in PRODUCTS] + [sid for sid, *_ in SERVICES] + [200]
+    for listing in db.query(Listing).filter(Listing.id.in_(demo_ids)).all():
+        if listing.review_status != "approved":
+            listing.review_status = "approved"
+
+
 def seed(db: Session) -> None:
+    seed_blocked_keywords(db)
+    _ensure_admin_user(db)
+    _seed_platform_config(db)
     if db.query(Listing).first():
         _sync_listing_translations(db)
         _sync_user_avatars(db)
+        _sync_demo_review_status(db)
         demo = db.query(User).filter(User.id == "12345678").first()
         if demo:
             _seed_inbox_notifications(db, demo.id)
             issue_welcome_coupon(db, demo.id, demo.language)
             issue_referral_coupon(db, demo.id, demo.language)
-            db.commit()
+        db.commit()
         return
 
     sellers: dict[str, User] = {}
@@ -179,6 +281,7 @@ def seed(db: Session) -> None:
             region_area=loc if loc != "Melbourne CBD" else "Melbourne CBD",
             image_url=img,
             status="active",
+            review_status="approved",
             negotiable=True,
             escrow_supported=True,
             view_count=10 + pid * 3,
@@ -207,6 +310,7 @@ def seed(db: Session) -> None:
         region_area="Clayton",
         image_url=IMAGES[5],
         status="active",
+        review_status="approved",
         negotiable=True,
         escrow_supported=True,
         view_count=48,
@@ -250,6 +354,7 @@ def seed(db: Session) -> None:
             region_area="Clayton",
             image_url=img,
             status="active",
+            review_status="approved",
             service_icon=icon,
         )
         listing.images = [img]

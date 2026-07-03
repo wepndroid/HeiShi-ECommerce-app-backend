@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,10 +11,24 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.routers import auth, catalog, listings, messages, orders, region_safety, user_data, users
+from app.routers import admin_routes
+from app.payments.router import router as payments_router
 from app.migrations import run_migrations
 from app.conversation_inbox import cleanup_duplicate_empty_conversations
 from app.messaging_read import backfill_read_watermarks
 from app.seed import seed
+
+
+async def _auto_confirm_loop() -> None:
+    while True:
+        await asyncio.sleep(3600)
+        db = SessionLocal()
+        try:
+            from app.order_jobs import process_auto_confirm_orders
+
+            process_auto_confirm_orders(db)
+        finally:
+            db.close()
 
 
 @asynccontextmanager
@@ -24,10 +39,15 @@ async def lifespan(_app: FastAPI):
     try:
         backfill_read_watermarks(db)
         cleanup_duplicate_empty_conversations(db)
+        from app.order_jobs import process_auto_confirm_orders
+
+        process_auto_confirm_orders(db)
         seed(db)
     finally:
         db.close()
+    task = asyncio.create_task(_auto_confirm_loop())
     yield
+    task.cancel()
 
 
 app = FastAPI(
@@ -76,6 +96,8 @@ app.include_router(users.payments_router, prefix=API_PREFIX)
 app.include_router(users.payouts_router, prefix=API_PREFIX)
 app.include_router(users.settings_router, prefix=API_PREFIX)
 app.include_router(region_safety.router, prefix=API_PREFIX)
+app.include_router(payments_router, prefix=API_PREFIX)
+app.include_router(admin_routes.router, prefix=API_PREFIX)
 
 
 @app.exception_handler(HTTPException)

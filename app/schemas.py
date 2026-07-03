@@ -45,6 +45,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class LoginOtpRequest(BaseModel):
+    phone: str
+    verificationCode: str
+
+
 class SyncProfileRequest(BaseModel):
     """Create/update app profile after Supabase phone OTP verification."""
 
@@ -82,11 +87,15 @@ class SellerDto(BaseModel):
     nickname: str
     avatarUrl: str | None = None
     verified: bool | None = None
+    phoneVerified: bool | None = None
+    identityVerified: bool | None = None
+    completedOrderCount: int | None = None
+    positiveRatingRate: int | None = None
 
 
 class ListingSummaryDto(BaseModel):
     id: int
-    type: Literal["product", "service", "bundle"]
+    type: Literal["product", "service", "bundle", "job", "rental"]
     title: str
     description: str | None = None
     price: float
@@ -98,8 +107,11 @@ class ListingSummaryDto(BaseModel):
     images: list[str] = Field(default_factory=list)
     seller: SellerDto
     status: Literal["active", "draft", "sold", "inactive"]
+    reviewStatus: Literal["pendingReview", "approved", "rejected", "removed", "draft"] = "approved"
     createdAt: str
     favoriteCount: int | None = None
+    isPinned: bool | None = None
+    isRecommended: bool | None = None
 
 
 class ListingDetailDto(ListingSummaryDto):
@@ -128,7 +140,7 @@ class BundleItemRequest(BaseModel):
 
 # Listings
 class CreateListingRequest(BaseModel):
-    type: Literal["product", "service", "bundle"]
+    type: Literal["product", "service", "bundle", "job", "rental"]
     title: str
     description: str
     price: float
@@ -141,6 +153,7 @@ class CreateListingRequest(BaseModel):
     imageUrls: list[str]
     pickupMethods: list[str] | None = None
     bundleItems: list[BundleItemRequest] | None = None
+    merchantPost: bool | None = False
     pickupDeadline: str | None = None
     allowSeparateSale: bool | None = True
     pickupWindow: str | None = None
@@ -209,10 +222,21 @@ class OrderDto(BaseModel):
     listingImageUrl: str
     seller: SellerDto
     buyer: SellerDto | None = None
-    status: Literal["pendingPay", "pendingShip", "pendingReceive", "pendingReview", "completed", "cancelled"]
+    status: Literal[
+        "pendingPay",
+        "pendingShip",
+        "pendingService",
+        "pendingReceive",
+        "pendingReview",
+        "completed",
+        "cancelled",
+        "inDispute",
+        "refundInProgress",
+    ]
     amount: float
     escrowFee: float
     currency: Literal["AUD"] = "AUD"
+    displayAmountCny: float | None = None
     deliveryMethod: str | None = None
     paymentMethodId: str | None = None
     bundleItemId: str | None = None
@@ -437,6 +461,17 @@ class VerificationStatusDto(BaseModel):
     alipayBound: bool
     identityVerified: bool
     businessVerified: bool
+    submissionStatus: Literal["not_submitted", "pending", "approved", "rejected"] = "not_submitted"
+
+
+class VerificationSubmitRequest(BaseModel):
+    legalName: str = Field(min_length=1, max_length=100)
+    idCountry: str = Field(default="AU", max_length=2)
+    idFrontUrl: str = Field(min_length=1, max_length=500)
+    idBackUrl: str | None = Field(default=None, max_length=500)
+    businessName: str | None = Field(default=None, max_length=100)
+    businessRegUrl: str | None = Field(default=None, max_length=500)
+    abn: str | None = Field(default=None, max_length=20)
 
 
 class PublicUserProfileDto(BaseModel):
@@ -461,27 +496,27 @@ class PublicUserProfileDto(BaseModel):
 
 class PaymentMethodDto(BaseModel):
     id: str
-    type: Literal["card", "apple_pay", "paypal"]
+    type: Literal["card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal"]
     label: str
     last4: str | None = None
     isDefault: bool | None = None
 
 
 class AddPaymentMethodRequest(BaseModel):
-    type: Literal["card", "apple_pay", "paypal"]
+    type: Literal["card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal"]
     token: str
 
 
 class PayoutMethodDto(BaseModel):
     id: str
-    type: Literal["bank", "paypal"]
+    type: Literal["bank", "paypal", "alipay", "wechat"]
     label: str
     last4: str | None = None
     isDefault: bool | None = None
 
 
 class AddPayoutMethodRequest(BaseModel):
-    type: Literal["bank", "paypal"]
+    type: Literal["bank", "paypal", "alipay", "wechat"]
     accountToken: str
 
 
@@ -562,10 +597,11 @@ class ReportSummaryDto(BaseModel):
 
 
 class SubmitReportRequest(BaseModel):
-    targetType: Literal["listing", "user"]
+    targetType: Literal["listing", "user", "chat", "order", "service"]
     targetId: str
     reason: str
     details: str | None = None
+    evidenceUrls: list[str] = Field(default_factory=list)
 
 
 class BlocklistUserDto(BaseModel):

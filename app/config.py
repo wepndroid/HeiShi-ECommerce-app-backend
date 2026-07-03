@@ -12,8 +12,19 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     upload_dir: str = "uploads"
     escrow_fee: float = 0.99
+    aud_to_cny_display_rate: float = 4.75
     pending_pay_expire_minutes: int = 30
+    admin_seed_phone: str = "0499999001"
+    admin_seed_password: str = "Admin123!"
+    # Legacy phone-OTP dev mode: when true, register/login send-code responses include the
+    # OTP as `devCode` (no real SMS provider wired yet). Set false in production once Twilio
+    # is configured so codes are delivered by SMS only.
     expose_dev_otp: bool = True
+    payments_simulated: bool = True
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    paypal_client_id: str = ""
+    paypal_client_secret: str = ""
 
     # Supabase Auth (Path A — phone OTP). When jwt_secret is set, API accepts Supabase JWTs.
     supabase_url: str = ""

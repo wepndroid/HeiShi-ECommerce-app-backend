@@ -1,13 +1,16 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from PIL import UnidentifiedImageError
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session, joinedload
 
-from app.auth import get_accept_language, get_current_user_optional
+from app.analytics import record_promotion_click
+from app.auth import get_accept_language, get_current_user, get_current_user_optional
 from app.blocklist_helpers import exclude_blocked_sellers, users_blocked
 from app.catalog_helpers import (
     apply_feed_listing_status_filter,
+    apply_feed_sort,
     apply_region_filter,
     apply_search,
     apply_tab_filter,
@@ -20,7 +23,7 @@ from app.database import get_db
 from app.form_options import LISTING_FORM_OPTIONS
 from app.image_search import hamming_distance, hash_image_bytes, hash_image_url, is_similar_enough
 from app.media_urls import normalize_media_url, normalize_media_urls
-from app.models import Favorite, Listing, Order, User, ViewHistory
+from app.models import Favorite, Listing, Order, Review, User, ViewHistory
 from app.pagination import paginate
 from app.schemas import (
     ImageSearchResponseDto,
@@ -34,6 +37,58 @@ from app.schemas import (
 from app.serializers import listing_to_detail, listing_to_service, listing_to_summary
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
+
+
+def _seller_completed_counts(db: Session, listings: list[Listing]) -> dict[str, int]:
+    seller_ids = {item.seller_id for item in listings if item.seller_id}
+    if not seller_ids:
+        return {}
+    rows = (
+        db.query(Order.seller_id, func.count(Order.id))
+        .filter(
+            Order.seller_id.in_(seller_ids),
+            Order.status.in_(("completed", "pendingReview")),
+        )
+        .group_by(Order.seller_id)
+        .all()
+    )
+    return dict(rows)
+
+
+def _seller_positive_rating_rates(db: Session, listings: list[Listing]) -> dict[str, int]:
+    seller_ids = {item.seller_id for item in listings if item.seller_id}
+    if not seller_ids:
+        return {}
+    rows = (
+        db.query(
+            Order.seller_id,
+            func.count(Review.id),
+            func.sum(case((Review.rating >= 4, 1), else_=0)),
+        )
+        .join(Review, Review.order_id == Order.id)
+        .filter(Order.seller_id.in_(seller_ids))
+        .group_by(Order.seller_id)
+        .all()
+    )
+    rates: dict[str, int] = {}
+    for seller_id, total, positive in rows:
+        if total and positive is not None:
+            rates[seller_id] = round(int(positive) * 100 / int(total))
+    return rates
+
+
+def _summarize_listings(db: Session, items: list[Listing], lang: str) -> list[ListingSummaryDto]:
+    counts = _seller_completed_counts(db, items)
+    rates = _seller_positive_rating_rates(db, items)
+    return [
+        listing_to_summary(
+            item,
+            lang,
+            completed_order_count=counts.get(item.seller_id, 0),
+            positive_rating_rate=rates.get(item.seller_id),
+        )
+        for item in items
+    ]
 
 
 def _user_can_view_inactive_listing(db: Session, listing: Listing, user: User | None) -> bool:
@@ -73,8 +128,17 @@ def _user_can_view_inactive_listing(db: Session, listing: Listing, user: User | 
 
 
 @router.get("/form-options", response_model=ListingFormOptionsDto)
-def get_form_options():
-    return LISTING_FORM_OPTIONS
+def get_form_options(db: Session = Depends(get_db)):
+    from app.platform_config import form_options_from_db
+
+    return form_options_from_db(db)
+
+
+@router.get("/banners")
+def get_banners(position: str = Query("home"), db: Session = Depends(get_db)):
+    from app.platform_config import banners_from_db
+
+    return {"items": banners_from_db(db, position)}
 
 
 @router.get("/feed", response_model=Paginated[ListingSummaryDto])
@@ -101,10 +165,10 @@ def get_feed(
     q = apply_tab_filter(q, tab)
     if categoryKey and tab != "services":
         q = q.filter(Listing.category_key == categoryKey)
-    q = q.order_by(Listing.created_at.desc())
+    q = apply_feed_sort(q)
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+    return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
 
 
 @router.post("/search/image", response_model=ImageSearchResponseDto)
@@ -165,7 +229,7 @@ async def search_by_image(
     total = len(scored)
     offset = (page - 1) * pageSize
     page_items = scored[offset : offset + pageSize]
-    summaries = [listing_to_summary(listing, lang) for _, listing in page_items]
+    summaries = _summarize_listings(db, [listing for _, listing in page_items], lang)
 
     top = scored[0][1] if scored else None
     if top:
@@ -214,7 +278,7 @@ def search(
     query = apply_search(query, q, sort)
     total = query.count()
     items = query.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+    return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
 
 
 @router.get("/listings/{listing_id}", response_model=ListingDetailDto)
@@ -267,7 +331,7 @@ def get_related(
     q = q.order_by(Listing.created_at.desc())
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
+    return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
 
 
 @router.get("/services", response_model=Paginated[LocalServiceDto])
@@ -298,18 +362,23 @@ def get_suggestions(
     regionState: str | None = None,
     regionCity: str | None = None,
     regionArea: str | None = None,
+    q: str | None = None,
     db: Session = Depends(get_db),
     user: User | None = Depends(get_current_user_optional),
 ):
     lang = get_accept_language(request)
     viewer_id = user.id if user else None
-    q = db.query(Listing)
-    q = apply_feed_listing_status_filter(q, db, viewer_id)
-    q = exclude_unpaid_reserved(q, db, viewer_id)
-    q = apply_region_filter(q, regionState, regionCity, regionArea)
-    q = q.order_by(Listing.view_count.desc()).limit(8)
+    qry = db.query(Listing)
+    qry = apply_feed_listing_status_filter(qry, db, viewer_id)
+    qry = exclude_unpaid_reserved(qry, db, viewer_id)
+    qry = apply_region_filter(qry, regionState, regionCity, regionArea)
+    if q and q.strip():
+        qry = apply_search(qry, q.strip(), "relevance")
+    else:
+        qry = qry.order_by(Listing.view_count.desc())
+    qry = qry.limit(4)
     results = []
-    for listing in q.all():
+    for listing in qry.all():
         title = listing.title_zh if lang == "zh" and listing.title_zh else listing.title
         words = title.split()
         query = words[0].lower() if words else title[:10].lower()
@@ -326,3 +395,13 @@ def get_suggestions(
             )
         )
     return results
+
+
+@router.post("/listings/{listing_id}/promotion-click", status_code=204)
+def promotion_click(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_current_user_optional),
+):
+    record_promotion_click(db, listing_id, user.id if user else None)
+    return Response(status_code=204)

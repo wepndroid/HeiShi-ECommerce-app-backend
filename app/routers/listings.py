@@ -11,6 +11,7 @@ from app.catalog_helpers import compute_purchase_available, reset_bundle_meta_fo
 from app.config import settings
 from app.database import get_db
 from app.models import Conversation, Favorite, Listing, Order, User, ViewHistory
+from app.moderation import find_blocked_keyword
 from app.pagination import paginate
 from app.schemas import CreateListingRequest, ListingDetailDto, ListingSummaryDto, Paginated, UploadImageResponse, BundleItemRequest
 from app.serializers import listing_to_detail, listing_to_summary
@@ -248,6 +249,36 @@ def create_listing(
     if body.imageUrls:
         _validate_listing_image_urls(body.imageUrls)
     listing_type = body.type
+    if listing_type == "job" and body.merchantPost and not user.business_verified:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "MERCHANT_VERIFICATION_REQUIRED",
+                "message": "Merchant verification required for business gig posts",
+                "details": {},
+            },
+        )
+    if listing_type in ("service", "job") and not is_draft and not user.identity_verified:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "IDENTITY_REQUIRED",
+                "message": "Identity verification required to publish this listing type",
+                "details": {},
+            },
+        )
+    if not is_draft:
+        blocked = find_blocked_keyword(db, f"{body.title}\n{body.description or ''}")
+        if blocked:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "BLOCKED_CONTENT",
+                    "message": "Listing contains blocked content",
+                    "details": {"keyword": blocked},
+                },
+            )
+    review_status = "draft" if is_draft else "pendingReview"
     service_icon = None
     if listing_type == "bundle":
         if is_draft and (not body.bundleItems or len(body.bundleItems) < 2):
@@ -289,6 +320,7 @@ def create_listing(
         region_city=body.regionCity or "Melbourne",
         region_area=body.locationLabel,
         status=status,
+        review_status=review_status,
     )
     listing.images = body.imageUrls
     listing.pickup_methods = body.pickupMethods or ["meetup"]

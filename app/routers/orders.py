@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
+import json
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
@@ -22,6 +24,8 @@ from app.config import settings
 from app.coupon_service import refresh_expired_coupons
 from app.database import SessionLocal, get_db
 from app.models import Coupon, Listing, Order, Review, User
+from app.order_jobs import schedule_auto_confirm
+from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
 from app.pagination import paginate
 from app.push_notifications import send_order_paid_push, send_order_remind_push
 from app.schemas import (
@@ -37,7 +41,12 @@ from app.serializers import iso, order_to_dto
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
-OPEN_ORDER_STATUSES = ("pendingPay", "pendingShip", "pendingReceive", "pendingReview")
+OPEN_ORDER_STATUSES = ("pendingPay", "pendingShip", "pendingService", "pendingReceive", "pendingReview")
+
+
+def _set_display_amount_cny(order: Order) -> None:
+    if order.amount and order.amount > 0:
+        order.display_amount_cny = round(float(order.amount) * settings.aud_to_cny_display_rate, 2)
 
 
 def _criteria_overall_rating(criteria: ReviewCriteriaDto) -> int:
@@ -303,6 +312,7 @@ def create_order(
         coupon_id=coupon_id,
         discount_amount=discount,
     )
+    _set_display_amount_cny(order)
     db.add(order)
     db.commit()
     db.refresh(order)
@@ -346,9 +356,36 @@ def update_order(
         order.discount_amount = discount
         order.coupon_id = resolved_coupon
     order.updated_at = datetime.now(timezone.utc)
+    _set_display_amount_cny(order)
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
+
+
+class SellerAdjustAmountRequest(BaseModel):
+    amount: float = Field(gt=0)
+
+
+@router.post("/{order_id}/seller-adjust-amount", response_model=OrderDto)
+def seller_adjust_amount(
+    order_id: int,
+    body: SellerAdjustAmountRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = _get_seller_order(db, order_id, user.id)
+    if order.status != "pendingPay":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Only unpaid orders can be repriced", "details": {}},
+        )
+    order.amount = round(body.amount, 2)
+    _set_display_amount_cny(order)
+    order.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return order_to_dto(order, get_accept_language(request), include_buyer=True)
 
 
 @router.post("/{order_id}/pay", response_model=OrderDto)
@@ -362,6 +399,11 @@ def pay_order(
     order = _get_buyer_order(db, order_id, user.id)
     if order.status != "pendingPay":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending payment", "details": {}})
+    if not settings.payments_simulated and order.payment_status not in ("succeeded", "paid"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PAYMENT_PENDING", "message": "Payment has not been confirmed yet", "details": {}},
+        )
     listing = (
         db.query(Listing)
         .filter(Listing.id == order.listing_id)
@@ -385,17 +427,7 @@ def pay_order(
         order.amount = payable
         order.discount_amount = discount
         order.escrow_fee = settings.escrow_fee if listing.escrow_supported else 0.0
-    _mark_coupon_used(db, order.coupon_id)
-    order.status = "pendingShip"
-    order.updated_at = datetime.now(timezone.utc)
-    if listing and listing.status == "active":
-        if order.bundle_item_id:
-            apply_bundle_item_payment(listing, order.bundle_item_id)
-        elif listing.type == "bundle":
-            apply_bundle_payment(listing)
-        else:
-            listing.status = "sold"
-    db.commit()
+    fulfill_paid_order(db, order)
     db.refresh(order)
     paid_order = (
         db.query(Order)
@@ -421,6 +453,25 @@ def ship_order(order_id: int, request: Request, user: User = Depends(get_current
     if order.status != "pendingShip":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending ship", "details": {}})
     order.status = "pendingReceive"
+    schedule_auto_confirm(order)
+    order.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return order_to_dto(order, get_accept_language(request), include_buyer=True)
+
+
+@router.post("/{order_id}/complete-service", response_model=OrderDto)
+def complete_service_order(
+    order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    order = _get_seller_order(db, order_id, user.id)
+    if order.status != "pendingService":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Order is not pending service", "details": {}},
+        )
+    order.status = "pendingReceive"
+    schedule_auto_confirm(order)
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
@@ -505,9 +556,70 @@ def remind_ship(
 @router.post("/{order_id}/confirm-receive", response_model=OrderDto)
 def confirm_receive(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     order = _get_buyer_order(db, order_id, user.id)
-    if order.status != "pendingReceive":
-        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending receive", "details": {}})
+    if order.status not in ("pendingReceive", "pendingService"):
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending confirmation", "details": {}})
     order.status = "pendingReview"
+    order.auto_confirm_at = None
+    order.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return order_to_dto(order, get_accept_language(request))
+
+
+class OrderReasonRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    evidenceUrls: list[str] = Field(default_factory=list)
+
+
+@router.post("/{order_id}/refund", response_model=OrderDto)
+def request_refund(
+    order_id: int,
+    body: OrderReasonRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = _get_buyer_order(db, order_id, user.id)
+    if order.status not in ("pendingShip", "pendingService", "pendingReceive", "completed"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Refund cannot be requested for this order", "details": {}},
+        )
+    order.status = "refundInProgress"
+    order.payout_paused = True
+    order.dispute_status = "refund_requested"
+    order.dispute_reason = body.reason
+    order.dispute_evidence_json = json.dumps(body.evidenceUrls[:10])
+    order.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return order_to_dto(order, get_accept_language(request))
+
+
+class OpenDisputeRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    evidenceUrls: list[str] = Field(default_factory=list)
+
+
+@router.post("/{order_id}/dispute", response_model=OrderDto)
+def open_dispute(
+    order_id: int,
+    body: OpenDisputeRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = _get_buyer_order(db, order_id, user.id)
+    if order.status not in ("pendingShip", "pendingReceive", "pendingConfirm", "pendingService"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_STATE", "message": "Order cannot enter dispute in current state", "details": {}},
+        )
+    order.status = "inDispute"
+    order.payout_paused = True
+    order.dispute_status = "open"
+    order.dispute_reason = body.reason
+    order.dispute_evidence_json = json.dumps(body.evidenceUrls[:10])
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)

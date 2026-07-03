@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_accept_language, get_current_user
 from app.catalog_helpers import get_or_create_settings
 from app.database import get_db
-from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, ViewHistory
+from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, VerificationSubmission, ViewHistory
 from app.schemas import (
     AddPaymentMethodRequest,
     AddPayoutMethodRequest,
@@ -36,6 +36,7 @@ from app.schemas import (
     TransactionReminderSettingsDto,
     UserProfileUpdateRequest,
     VerificationStatusDto,
+    VerificationSubmitRequest,
 )
 from app.pagination import paginate
 from app.routers.region_safety import REGION_DATA
@@ -89,6 +90,20 @@ router = APIRouter(tags=["users"])
 payments_router = APIRouter(prefix="/payments", tags=["payments"])
 payouts_router = APIRouter(prefix="/payouts", tags=["payouts"])
 settings_router = APIRouter(prefix="/settings", tags=["settings"])
+
+
+def _verification_submission_status(db: Session, user_id: str) -> str:
+    sub = (
+        db.query(VerificationSubmission)
+        .filter(VerificationSubmission.user_id == user_id)
+        .order_by(VerificationSubmission.created_at.desc())
+        .first()
+    )
+    if not sub:
+        return "not_submitted"
+    if sub.status in ("pending", "approved", "rejected"):
+        return sub.status
+    return "pending"
 
 
 @router.get("/users/me/profile", response_model=AuthUserDto)
@@ -370,8 +385,42 @@ def list_received_reviews(
 
 
 @router.get("/users/me/verification", response_model=VerificationStatusDto)
-def get_verification(user: User = Depends(get_current_user)):
-    return verification_to_dto(user)
+def get_verification(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return verification_to_dto(user, submission_status=_verification_submission_status(db, user.id))
+
+
+@router.post("/users/me/verification/submit", response_model=VerificationStatusDto)
+def submit_verification(
+    body: VerificationSubmitRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    pending = (
+        db.query(VerificationSubmission)
+        .filter(VerificationSubmission.user_id == user.id, VerificationSubmission.status == "pending")
+        .first()
+    )
+    if pending:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ALREADY_PENDING", "message": "Verification already pending review", "details": {}},
+        )
+    db.add(
+        VerificationSubmission(
+            user_id=user.id,
+            legal_name=body.legalName.strip(),
+            id_country=body.idCountry.upper(),
+            id_front_url=body.idFrontUrl.strip(),
+            id_back_url=body.idBackUrl.strip() if body.idBackUrl else None,
+            business_name=body.businessName.strip() if body.businessName else None,
+            business_reg_url=body.businessRegUrl.strip() if body.businessRegUrl else None,
+            abn=body.abn.strip() if body.abn else None,
+            status="pending",
+        )
+    )
+    db.commit()
+    db.refresh(user)
+    return verification_to_dto(user, submission_status="pending")
 
 
 @router.post("/users/me/verification/bind", response_model=VerificationStatusDto)
@@ -380,17 +429,27 @@ def bind_verification(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if body.type in ("identity", "business"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "USE_SUBMIT_ENDPOINT",
+                "message": "Submit identity documents via POST /users/me/verification/submit",
+                "details": {},
+            },
+        )
     if body.type == "wechat":
         user.wechat_bound = True
     elif body.type == "alipay":
         user.alipay_bound = True
-    elif body.type == "identity":
-        user.identity_verified = True
-    elif body.type == "business":
-        user.business_verified = True
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "VALIDATION_ERROR", "message": "Unsupported verification type", "details": {}},
+        )
     db.commit()
     db.refresh(user)
-    return verification_to_dto(user)
+    return verification_to_dto(user, submission_status=_verification_submission_status(db, user.id))
 
 
 @router.get("/users/{user_id}/profile", response_model=PublicUserProfileDto)
@@ -461,7 +520,14 @@ def list_payment_methods(user: User = Depends(get_current_user), db: Session = D
 @payments_router.post("/methods", response_model=PaymentMethodDto, status_code=201)
 def add_payment_method(body: AddPaymentMethodRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     last4 = body.token[-4:] if len(body.token) >= 4 else "0000"
-    labels = {"card": f"Card •••• {last4}", "apple_pay": "Apple Pay", "paypal": "PayPal"}
+    labels = {
+        "card": f"Card •••• {last4}",
+        "apple_pay": "Apple Pay",
+        "google_pay": "Google Pay",
+        "alipay": "Alipay",
+        "wechat_pay": "WeChat Pay",
+        "paypal": "PayPal",
+    }
     count = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).count()
     pm = PaymentMethod(
         user_id=user.id,
@@ -519,7 +585,12 @@ def list_payout_methods(user: User = Depends(get_current_user), db: Session = De
 @payouts_router.post("/methods", response_model=PayoutMethodDto, status_code=201)
 def add_payout_method(body: AddPayoutMethodRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     last4 = body.accountToken[-4:] if len(body.accountToken) >= 4 else "0000"
-    labels = {"bank": f"Bank •••• {last4}", "paypal": "PayPal"}
+    labels = {
+        "bank": f"Bank •••• {last4}",
+        "paypal": "PayPal",
+        "alipay": "Alipay",
+        "wechat": "WeChat",
+    }
     count = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).count()
     pm = PayoutMethod(
         user_id=user.id,
@@ -684,5 +755,5 @@ def export_user_data(user: User = Depends(get_current_user), db: Session = Depen
         privacySettings=settings_to_privacy(settings_row),
         transactionReminderSettings=settings_to_transaction_reminders(settings_row),
         addresses=[address_to_dto(a) for a in addresses],
-        verification=verification_to_dto(user),
+        verification=verification_to_dto(user, submission_status=_verification_submission_status(db, user.id)),
     )

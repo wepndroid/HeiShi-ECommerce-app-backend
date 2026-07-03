@@ -51,6 +51,13 @@ class User(Base):
     alipay_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     identity_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     business_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    account_status: Mapped[str] = mapped_column(String(20), default="normal", index=True)
+    admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    banned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stripe_connect_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    preferred_display_currency: Mapped[str] = mapped_column(String(3), default="aud")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     listings: Mapped[list[Listing]] = relationship(back_populates="seller")
@@ -114,6 +121,13 @@ class Listing(Base):
     service_icon: Mapped[str | None] = mapped_column(String(30), nullable=True)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
     favorite_count: Mapped[int] = mapped_column(Integer, default=0)
+    review_status: Mapped[str] = mapped_column(String(20), default="pendingReview", index=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    is_recommended: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    promotion_click_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     seller: Mapped[User] = relationship(back_populates="listings")
@@ -170,6 +184,22 @@ class Order(Base):
     bundle_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     coupon_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     discount_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    payment_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    psp: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    payment_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    psp_payment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    psp_transaction_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    charge_currency: Mapped[str] = mapped_column(String(3), default="aud")
+    amount_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    display_amount_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
+    payout_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_abnormal: Mapped[bool] = mapped_column(Boolean, default=False)
+    admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dispute_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    dispute_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dispute_evidence_json: Mapped[str] = mapped_column(Text, default="[]")
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    auto_confirm_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -324,8 +354,24 @@ class SafetyReport(Base):
     target_id: Mapped[str] = mapped_column(String(50))
     reason: Mapped[str] = mapped_column(String(100))
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_urls_json: Mapped[str] = mapped_column(Text, default="[]")
+    handler_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    handled_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    @property
+    def evidence_urls(self) -> list[str]:
+        try:
+            parsed = json.loads(self.evidence_urls_json)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+
+    @evidence_urls.setter
+    def evidence_urls(self, value: list[str]) -> None:
+        self.evidence_urls_json = json.dumps(value)
 
 
 class BlocklistEntry(Base):
@@ -369,3 +415,115 @@ class Review(Base):
     professionalism_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hire_again_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VerificationSubmission(Base):
+    __tablename__ = "verification_submissions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    legal_name: Mapped[str] = mapped_column(String(100))
+    id_country: Mapped[str] = mapped_column(String(2), default="AU")
+    id_front_url: Mapped[str] = mapped_column(String(500))
+    id_back_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    business_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    business_reg_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    abn: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    user: Mapped[User] = relationship()
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    admin_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    action_type: Mapped[str] = mapped_column(String(50))
+    target_type: Mapped[str] = mapped_column(String(30))
+    target_id: Mapped[str] = mapped_column(String(50))
+    before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BlockedKeyword(Base):
+    __tablename__ = "blocked_keywords"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pattern: Mapped[str] = mapped_column(String(200), unique=True)
+    locale: Mapped[str] = mapped_column(String(5), default="all")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class PlatformCategory(Base):
+    __tablename__ = "platform_categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    type: Mapped[str] = mapped_column(String(20), index=True)
+    key: Mapped[str] = mapped_column(String(50), unique=True)
+    label_en: Mapped[str] = mapped_column(String(100))
+    label_zh: Mapped[str] = mapped_column(String(100))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class PlatformBanner(Base):
+    __tablename__ = "platform_banners"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    title: Mapped[str] = mapped_column(String(200))
+    image_url: Mapped[str] = mapped_column(String(500))
+    link_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    position: Mapped[str] = mapped_column(String(20), default="home")
+    online_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlatformRegion(Base):
+    __tablename__ = "platform_regions"
+    __table_args__ = (UniqueConstraint("country", "state", "city", "area", name="uq_platform_region"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    country: Mapped[str] = mapped_column(String(2), default="AU")
+    state: Mapped[str] = mapped_column(String(10), index=True)
+    city: Mapped[str] = mapped_column(String(50), index=True)
+    area: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    label_en: Mapped[str] = mapped_column(String(100))
+    label_zh: Mapped[str] = mapped_column(String(100))
+    is_default_city: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class PromotionClickEvent(Base):
+    __tablename__ = "promotion_click_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DailyActiveUser(Base):
+    __tablename__ = "daily_active_users"
+    __table_args__ = (UniqueConstraint("day", name="uq_daily_active_users_day"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)
+    user_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class DailyActiveUserHit(Base):
+    __tablename__ = "daily_active_user_hits"
+    __table_args__ = (UniqueConstraint("user_id", "day", name="uq_dau_user_day"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)

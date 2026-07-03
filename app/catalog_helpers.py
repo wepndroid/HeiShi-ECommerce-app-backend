@@ -74,7 +74,22 @@ def apply_tab_filter(q: Query, tab: str | None) -> Query:
         return q.filter(Listing.type == "service")
     if tab == "tickets":
         return q.filter(Listing.category_key == "tickets")
+    if tab == "jobs":
+        return q.filter(Listing.type == "job")
+    if tab == "rentals":
+        return q.filter(Listing.type == "rental")
+    if tab == "secondhand":
+        return q.filter(Listing.type.in_(("product", "bundle")))
     return q
+
+
+def apply_feed_sort(q: Query) -> Query:
+    """Pinned and recommended listings surface first, then newest."""
+    return q.order_by(
+        Listing.is_pinned.desc(),
+        Listing.is_recommended.desc(),
+        Listing.created_at.desc(),
+    )
 
 
 def exclude_unpaid_reserved(q: Query, db: Session, viewer_user_id: str | None = None) -> Query:
@@ -87,10 +102,10 @@ def exclude_unpaid_reserved(q: Query, db: Session, viewer_user_id: str | None = 
 
 
 def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None) -> Query:
-    """Active listings for everyone; also show sold/inactive listings tied to the user's orders."""
-    active = Listing.status == "active"
+    """Public feed: active listings with admin-approved review status."""
+    approved = (Listing.status == "active") & (Listing.review_status == "approved")
     if not user_id:
-        return q.filter(active)
+        return q.filter(approved)
     linked_listing_ids = (
         db.query(Order.listing_id)
         .filter(
@@ -99,7 +114,8 @@ def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None)
         )
         .distinct()
     )
-    return q.filter(or_(active, Listing.id.in_(linked_listing_ids)))
+    own_listings = Listing.seller_id == user_id
+    return q.filter(or_(approved, Listing.id.in_(linked_listing_ids), own_listings))
 
 
 def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
@@ -113,9 +129,9 @@ def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
     elif sort == "newest":
         q = q.order_by(Listing.created_at.desc())
     elif sort == "relevance" and q_text:
-        q = q.order_by(Listing.view_count.desc(), Listing.created_at.desc())
+        q = q.order_by(Listing.is_pinned.desc(), Listing.is_recommended.desc(), Listing.view_count.desc(), Listing.created_at.desc())
     else:
-        q = q.order_by(Listing.created_at.desc())
+        q = q.order_by(Listing.is_pinned.desc(), Listing.is_recommended.desc(), Listing.created_at.desc())
     return q
 
 

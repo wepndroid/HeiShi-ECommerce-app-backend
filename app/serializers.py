@@ -115,7 +115,13 @@ def public_user_profile(
     )
 
 
-def seller_to_dto(user: User, lang: str = "en") -> SellerDto:
+def seller_to_dto(
+    user: User,
+    lang: str = "en",
+    *,
+    completed_order_count: int | None = None,
+    positive_rating_rate: int | None = None,
+) -> SellerDto:
     nickname = user.nickname
     if lang == "zh":
         nickname = _SELLER_NICKNAME_ZH.get(user.id, nickname)
@@ -124,6 +130,10 @@ def seller_to_dto(user: User, lang: str = "en") -> SellerDto:
         nickname=nickname,
         avatarUrl=_user_avatar_url(user),
         verified=user.identity_verified or user.business_verified,
+        phoneVerified=user.phone_verified,
+        identityVerified=user.identity_verified,
+        completedOrderCount=completed_order_count,
+        positiveRatingRate=positive_rating_rate,
     )
 
 
@@ -153,9 +163,16 @@ def listing_description(listing: Listing, lang: str = "en") -> str | None:
     return desc or None
 
 
-def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
-    listing_type = listing.type if listing.type in ("product", "service", "bundle") else "product"
+def listing_to_summary(
+    listing: Listing,
+    lang: str = "en",
+    *,
+    completed_order_count: int | None = None,
+    positive_rating_rate: int | None = None,
+) -> ListingSummaryDto:
+    listing_type = listing.type if listing.type in ("product", "service", "bundle", "job", "rental") else "product"
     status = listing.status if listing.status in ("active", "draft", "sold", "inactive") else "active"
+    review_status = listing.review_status if listing.review_status in ("pendingReview", "approved", "rejected", "removed", "draft") else "approved"
     images = normalize_media_urls(listing.images)
     cover = images[0] if images else normalize_media_url(listing.image_url)
     return ListingSummaryDto(
@@ -169,10 +186,18 @@ def listing_to_summary(listing: Listing, lang: str = "en") -> ListingSummaryDto:
         locationLabel=listing.location_label,
         imageUrl=cover or "",
         images=images,
-        seller=seller_to_dto(listing.seller, lang),
+        seller=seller_to_dto(
+            listing.seller,
+            lang,
+            completed_order_count=completed_order_count,
+            positive_rating_rate=positive_rating_rate,
+        ),
         status=status,
+        reviewStatus=review_status,
         createdAt=iso(listing.created_at),
         favoriteCount=listing.favorite_count or 0,
+        isPinned=listing.is_pinned,
+        isRecommended=listing.is_recommended,
     )
 
 
@@ -250,7 +275,15 @@ def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
 
 def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False) -> OrderDto:
     status = order.status if order.status in (
-        "pendingPay", "pendingShip", "pendingReceive", "pendingReview", "completed", "cancelled"
+        "pendingPay",
+        "pendingShip",
+        "pendingService",
+        "pendingReceive",
+        "pendingReview",
+        "completed",
+        "cancelled",
+        "inDispute",
+        "refundInProgress",
     ) else "pendingPay"
     buyer = seller_to_dto(order.buyer, lang) if include_buyer and order.buyer else None
     return OrderDto(
@@ -263,6 +296,7 @@ def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False)
         status=status,
         amount=order.amount,
         escrowFee=order.escrow_fee,
+        displayAmountCny=order.display_amount_cny,
         deliveryMethod=order.delivery_method,
         paymentMethodId=order.payment_method_id,
         bundleItemId=order.bundle_item_id,
@@ -356,12 +390,14 @@ def address_to_dto(addr: Address) -> AddressDto:
 
 
 def payment_to_dto(pm: PaymentMethod) -> PaymentMethodDto:
-    pm_type = pm.type if pm.type in ("card", "apple_pay", "paypal") else "card"
+    allowed = ("card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal")
+    pm_type = pm.type if pm.type in allowed else "card"
     return PaymentMethodDto(id=pm.id, type=pm_type, label=pm.label, last4=pm.last4, isDefault=pm.is_default)
 
 
 def payout_to_dto(pm: PayoutMethod) -> PayoutMethodDto:
-    pm_type = pm.type if pm.type in ("bank", "paypal") else "bank"
+    allowed = ("bank", "paypal", "alipay", "wechat")
+    pm_type = pm.type if pm.type in allowed else "bank"
     return PayoutMethodDto(id=pm.id, type=pm_type, label=pm.label, last4=pm.last4, isDefault=pm.is_default)
 
 
@@ -391,13 +427,15 @@ def settings_to_transaction_reminders(s: UserSettings) -> TransactionReminderSet
     )
 
 
-def verification_to_dto(user: User) -> VerificationStatusDto:
+def verification_to_dto(user: User, *, submission_status: str = "not_submitted") -> VerificationStatusDto:
+    status = submission_status if submission_status in ("not_submitted", "pending", "approved", "rejected") else "not_submitted"
     return VerificationStatusDto(
         phoneVerified=user.phone_verified,
         wechatBound=user.wechat_bound,
         alipayBound=user.alipay_bound,
         identityVerified=user.identity_verified,
         businessVerified=user.business_verified,
+        submissionStatus=status,
     )
 
 

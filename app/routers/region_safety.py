@@ -130,8 +130,10 @@ REGION_DATA: list[RegionDto] = [
 
 
 @router.get("/regions", response_model=list[RegionDto])
-def get_regions():
-    return REGION_DATA
+def get_regions(db: Session = Depends(get_db)):
+    from app.platform_config import regions_from_db
+
+    return regions_from_db(db)
 
 
 @router.get("/safety/reports", response_model=Paginated[ReportSummaryDto])
@@ -160,6 +162,8 @@ def submit_report(body: SubmitReportRequest, user: User = Depends(get_current_us
         reason=body.reason,
         details=body.details,
     )
+    if body.evidenceUrls:
+        report.evidence_urls = body.evidenceUrls[:10]
     db.add(report)
     db.commit()
     return Response(status_code=204)
