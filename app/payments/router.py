@@ -100,7 +100,7 @@ def create_checkout(
 
     try:
 
-        result = start_checkout(order, payment_method=body.paymentMethod)
+        result = start_checkout(order, payment_method=body.paymentMethod, db=db)
 
     except RuntimeError as exc:
 
@@ -132,6 +132,42 @@ def create_checkout(
 
 
 
+
+
+class ConfirmRequest(BaseModel):
+    orderId: int
+
+
+@router.post("/checkout/confirm", response_model=CheckoutResponse)
+def confirm_checkout(
+    body: ConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-check a PaymentIntent after in-app 3-D Secure and sync payment_status. Lets the
+    app finalise (call /orders/{id}/pay) without waiting on the webhook. No-op simulated."""
+    order = db.query(Order).filter(Order.id == body.orderId, Order.buyer_id == user.id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Order not found", "details": {}})
+    if order.psp == "stripe" and order.psp_payment_id and settings.stripe_secret_key.strip():
+        from app import stripe_service
+
+        try:
+            intent = stripe_service.retrieve_payment_intent(order.psp_payment_id)
+        except Exception:
+            intent = {}
+        status = intent.get("status")
+        if status == "succeeded" and order.status == "pendingPay":
+            order.payment_status = "succeeded"
+            order.psp_transaction_id = intent.get("id")
+            db.commit()
+    return CheckoutResponse(
+        psp=order.psp or "stripe",
+        paymentStatus=order.payment_status or "",
+        clientSecret=None,
+        checkoutUrl=None,
+        simulated=settings.payments_simulated,
+    )
 
 
 @router.post("/webhooks/stripe")

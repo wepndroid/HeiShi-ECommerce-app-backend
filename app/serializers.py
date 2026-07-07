@@ -74,6 +74,7 @@ def user_to_dto(user: User) -> AuthUserDto:
         id=user.id,
         nickname=user.nickname,
         phone=user.phone,
+        email=getattr(user, "email", None),
         avatarUrl=_user_avatar_url(user),
         bio=user.bio,
         city=user.city,
@@ -194,6 +195,7 @@ def listing_to_summary(
         ),
         status=status,
         reviewStatus=review_status,
+        reviewNote=listing.review_note,
         createdAt=iso(listing.created_at),
         favoriteCount=listing.favorite_count or 0,
         isPinned=listing.is_pinned,
@@ -392,13 +394,29 @@ def address_to_dto(addr: Address) -> AddressDto:
 def payment_to_dto(pm: PaymentMethod) -> PaymentMethodDto:
     allowed = ("card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal")
     pm_type = pm.type if pm.type in allowed else "card"
-    return PaymentMethodDto(id=pm.id, type=pm_type, label=pm.label, last4=pm.last4, isDefault=pm.is_default)
+    return PaymentMethodDto(
+        id=pm.id,
+        type=pm_type,
+        label=pm.label,
+        last4=pm.last4,
+        brand=getattr(pm, "brand", None),
+        expMonth=getattr(pm, "exp_month", None),
+        expYear=getattr(pm, "exp_year", None),
+        isDefault=pm.is_default,
+    )
 
 
 def payout_to_dto(pm: PayoutMethod) -> PayoutMethodDto:
     allowed = ("bank", "paypal", "alipay", "wechat")
     pm_type = pm.type if pm.type in allowed else "bank"
-    return PayoutMethodDto(id=pm.id, type=pm_type, label=pm.label, last4=pm.last4, isDefault=pm.is_default)
+    return PayoutMethodDto(
+        id=pm.id,
+        type=pm_type,
+        label=pm.label,
+        last4=pm.last4,
+        payoutsEnabled=getattr(pm, "payouts_enabled", None),
+        isDefault=pm.is_default,
+    )
 
 
 def settings_to_notification(s: UserSettings) -> NotificationSettingsDto:

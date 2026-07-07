@@ -26,6 +26,27 @@ EXPO_PUBLIC_API_URL=http://localhost:8000/v1
 EXPO_PUBLIC_API_MOCK_FALLBACK=false
 ```
 
+## Phone sign-up and login
+
+The backend supports two phone-OTP modes:
+
+- Supabase Auth phone OTP for the app's Supabase flow
+- Twilio Verify for production phone sign-up/login when these backend env vars are set:
+
+```
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_VERIFY_SERVICE_SID=...
+```
+
+When Twilio Verify is enabled, `/auth/register/send-code`, `/auth/register`, `/auth/login/send-code`,
+and `/auth/login/verify` use Twilio for SMS delivery and code verification. If those env vars
+are absent, the backend keeps using the legacy local OTP table as a dev fallback.
+
+If your frontend also has Supabase Auth env vars set for social login, add
+`EXPO_PUBLIC_PHONE_AUTH_PROVIDER=backend` in `Frontend/.env` so phone sign-up/login stays on the
+backend Twilio path while Supabase remains available for OAuth.
+
 ## Demo account
 
 | Field | Value |

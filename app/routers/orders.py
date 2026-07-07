@@ -399,6 +399,9 @@ def pay_order(
     order = _get_buyer_order(db, order_id, user.id)
     if order.status != "pendingPay":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending payment", "details": {}})
+    # Real (non-simulated) payments must be confirmed by the PSP first — the mobile runs
+    # /payments/checkout (PaymentIntent off the saved card, or a hosted session) and the
+    # webhook / confirm step sets payment_status before pay finalises the order.
     if not settings.payments_simulated and order.payment_status not in ("succeeded", "paid"):
         raise HTTPException(
             status_code=400,

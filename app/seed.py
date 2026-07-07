@@ -16,6 +16,10 @@ from app.models import (
     PaymentMethod,
     PlatformCategory,
     PlatformRegion,
+    PlatformSetting,
+    PlatformTopic,
+    ProductTag,
+    ReportReason,
     Review,
     SystemNotification,
     User,
@@ -142,6 +146,35 @@ _PLATFORM_CATEGORIES = [
     ("rental", "rentals", "Rentals", "租赁"),
 ]
 
+# 举报原因 — mirrors the mobile report sheet's REPORT_REASONS list.
+_REPORT_REASONS = [
+    ("prohibited", "Prohibited item", "违禁物品"),
+    ("counterfeit", "Counterfeit / fake", "假冒伪劣"),
+    ("fraud", "Fraud / scam", "欺诈骗局"),
+    ("offensive", "Offensive content", "不当内容"),
+    ("spam", "Spam / advertising", "垃圾广告"),
+    ("other", "Other", "其他"),
+]
+
+# 商品标签 — selectable tags a listing can carry.
+_PRODUCT_TAGS = [
+    ("hot", "Hot", "热门"),
+    ("new", "New arrival", "新上架"),
+    ("clearance", "Clearance", "清仓"),
+    ("graduation", "Graduation sale", "毕业清仓"),
+    ("negotiable", "Negotiable", "可议价"),
+]
+
+# 系统配置 defaults — home-module switches + legal docs (系统配置 SystemConfig page).
+_DEFAULT_SETTINGS = {
+    "home.module.banners": "on",
+    "home.module.categories": "on",
+    "home.module.recommended": "on",
+    "home.module.graduationZone": "on",
+    "legal.userAgreement": "By using HeyMarket you agree to trade responsibly and follow all local laws.",
+    "legal.privacyPolicy": "We collect only what is needed to run the marketplace and never sell your data.",
+}
+
 
 def _seed_platform_config(db: Session) -> None:
     if not db.query(PlatformCategory).first():
@@ -189,6 +222,26 @@ def _seed_platform_config(db: Session) -> None:
                         )
                     )
                     sort += 1
+    if not db.query(ReportReason).first():
+        for idx, (key, en, zh) in enumerate(_REPORT_REASONS):
+            db.add(ReportReason(key=key, label_en=en, label_zh=zh, sort_order=idx, active=True))
+    if not db.query(ProductTag).first():
+        for idx, (key, en, zh) in enumerate(_PRODUCT_TAGS):
+            db.add(ProductTag(key=key, label_en=en, label_zh=zh, sort_order=idx, active=True))
+    if not db.query(PlatformSetting).first():
+        for key, value in _DEFAULT_SETTINGS.items():
+            db.add(PlatformSetting(key=key, value=value))
+    if not db.query(PlatformTopic).first():
+        db.add(PlatformTopic(
+            title="Graduation clearance zone", title_zh="毕业二手清仓专区",
+            subtitle="Everything students need before they fly home", cover_image_url="",
+            tag_key="graduation", link_url="/topic/graduation", sort_order=0, enabled=True,
+        ))
+        db.add(PlatformTopic(
+            title="New arrivals", title_zh="新上架专区",
+            subtitle="Fresh listings this week", cover_image_url="",
+            tag_key="new", link_url="/topic/new", sort_order=1, enabled=True,
+        ))
     db.flush()
 
 
@@ -316,7 +369,7 @@ def seed(db: Session) -> None:
         view_count=48,
         favorite_count=12,
     )
-    bundle_listing.images = [IMAGES[0]]
+    bundle_listing.images = [IMAGES[1]]
     bundle_listing.pickup_methods = ["meetup"]
     bundle_listing.bundle_meta = {
         "fullPrice": 260,
@@ -324,7 +377,7 @@ def seed(db: Session) -> None:
         "allowSeparateSale": True,
         "pickupWindow": "weekdayEvening",
         "totalItems": 4,
-        "coverImageUrls": [IMAGES[0]],
+        "coverImageUrls": [IMAGES[1]],
         "items": [
             {"id": "desk", "title": "Nordic folding desk", "sharePrice": 35, "separatePrice": 35, "imageUrl": IMAGES[5], "status": "available"},
             {"id": "microwave", "title": "Microwave", "sharePrice": 45, "imageUrl": IMAGES[2], "status": "onHold"},

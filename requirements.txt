@@ -9,3 +9,5 @@ pydantic-settings==2.7.0
 bcrypt==4.2.1
 Pillow==11.1.0
 httpx==0.28.1
+stripe==11.4.0
+twilio>=9.0.0,<10.0.0

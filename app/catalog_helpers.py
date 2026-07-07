@@ -118,6 +118,11 @@ def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None)
     return q.filter(or_(approved, Listing.id.in_(linked_listing_ids), own_listings))
 
 
+def apply_public_listing_visibility_filter(q: Query) -> Query:
+    """Public seller/profile pages and direct public detail views."""
+    return q.filter(Listing.status == "active", Listing.review_status == "approved")
+
+
 def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
     if q_text:
         pattern = f"%{q_text.strip()}%"

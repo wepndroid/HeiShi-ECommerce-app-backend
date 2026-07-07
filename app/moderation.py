@@ -30,3 +30,19 @@ def find_blocked_keyword(db: Session, *texts: str) -> str | None:
         if row.pattern.lower() in haystack:
             return row.pattern
     return None
+
+
+def find_blocked_keywords(db: Session, *texts: str) -> list[str]:
+    """Return EVERY active blocked keyword found in the given texts (敏感词命中).
+
+    Used by the admin review UI to badge sensitive-word hits, unlike find_blocked_keyword
+    which short-circuits on the first match for post-time blocking.
+    """
+    haystack = " ".join(t for t in texts if t).lower()
+    if not haystack.strip():
+        return []
+    hits: list[str] = []
+    for row in db.query(BlockedKeyword).filter(BlockedKeyword.active.is_(True)).all():
+        if row.pattern.lower() in haystack and row.pattern not in hits:
+            hits.append(row.pattern)
+    return hits

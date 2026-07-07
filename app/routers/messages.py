@@ -244,6 +244,12 @@ def send_message(
     db: Session = Depends(get_db),
 ):
     conv = _get_conversation(db, conversation_id, user.id)
+    # Admin mute (禁言): a muted account cannot send chat messages.
+    if getattr(user, "is_muted", False):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "USER_MUTED", "message": "Your account is muted and cannot send messages", "details": {}},
+        )
     listing = db.query(Listing).filter(Listing.id == conv.listing_id).first()
     if listing and _listing_chat_unavailable(listing, db, conv.buyer_id, conv.seller_id):
         raise HTTPException(

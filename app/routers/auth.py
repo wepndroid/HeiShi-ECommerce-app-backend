@@ -34,6 +34,7 @@ from app.phone_verification import (
     issue_register_code,
     resend_allowed_at,
 )
+from app.twilio_otp import TwilioOtpError, send_sms_verification, verify_sms_code
 from app.schemas import (
     AuthTokensDto,
     AuthUserDto,
@@ -44,10 +45,17 @@ from app.schemas import (
     SendRegisterCodeRequest,
     SendRegisterCodeResponse,
     SyncProfileRequest,
+    OAuthProvisionRequest,
     ChangePasswordRequest,
 )
 from app.serializers import user_to_dto
-from app.supabase_auth import decode_supabase_jwt, phone_from_claims
+from app.supabase_auth import (
+    avatar_from_claims,
+    decode_supabase_jwt,
+    email_from_claims,
+    name_from_claims,
+    phone_from_claims,
+)
 from app.routers.region_safety import REGION_DATA
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -157,6 +165,61 @@ def sync_profile(
     return user_to_dto(user)
 
 
+@router.post("/oauth/provision", response_model=AuthUserDto)
+def oauth_provision(
+    body: OAuthProvisionRequest | None = None,
+    claims: dict = Depends(_require_supabase_claims),
+    db: Session = Depends(get_db),
+):
+    """Create-or-return the app profile for a Supabase OAuth (Google/Apple/WeChat) session.
+
+    Unlike /sync-profile this requires NO phone — OAuth identities are email-based. The
+    display name, email, and avatar default from the provider's JWT claims, so a Google
+    sign-in provisions an app user with no manual onboarding. Idempotent by Supabase sub.
+    """
+    user_id = claims["sub"]
+    existing = db.query(User).filter(User.id == user_id).first()
+    if existing is not None:
+        return user_to_dto(existing)
+
+    email = email_from_claims(claims)
+    phone = phone_from_claims(claims)  # normally None for Google/Apple
+    nickname = (
+        (body.nickname.strip() if body and body.nickname else None)
+        or name_from_claims(claims)
+        or (email.split("@")[0] if email else None)
+        or "New user"
+    )
+    avatar_url = avatar_from_claims(claims)
+    city = body.city.strip() if body and body.city else None
+
+    if phone:
+        clash = db.query(User).filter(User.phone == phone, User.id != user_id).first()
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
+            )
+
+    user = User(
+        id=user_id,
+        nickname=nickname[:50],
+        phone=phone,
+        email=email,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        heishi_id=generate_heishi_id(db, phone or user_id.replace("-", "")),
+        city=city,
+        avatar_url=avatar_url,
+        phone_verified=bool(phone),
+    )
+    db.add(user)
+    get_or_create_settings(db, user_id)
+    issue_welcome_coupon(db, user_id)
+    db.commit()
+    db.refresh(user)
+    return user_to_dto(user)
+
+
 def _validation_error(message: str = "Invalid phone format") -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -181,6 +244,28 @@ def _require_valid_city(raw_city: str) -> str:
     return city
 
 
+def _twilio_http_error(exc: TwilioOtpError) -> HTTPException:
+    if exc.code == "INVALID_PHONE":
+        return HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": str(exc), "details": {}},
+        )
+    if exc.code == "OTP_INVALID":
+        return HTTPException(
+            status_code=400,
+            detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
+        )
+    if exc.code in {"TWILIO_NOT_CONFIGURED", "TWILIO_NOT_INSTALLED"}:
+        return HTTPException(
+            status_code=503,
+            detail={"code": "TWILIO_NOT_CONFIGURED", "message": str(exc), "details": {}},
+        )
+    return HTTPException(
+        status_code=503,
+        detail={"code": "TWILIO_SEND_FAILED", "message": str(exc), "details": {}},
+    )
+
+
 def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
     access = create_access_token(user.id)
     refresh = create_refresh_token()
@@ -202,6 +287,22 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
             status_code=409,
             detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
         )
+
+    if settings.twilio_verify_partially_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TWILIO_NOT_CONFIGURED",
+                "message": "Twilio Verify env vars must all be set together",
+                "details": {},
+            },
+        )
+    if settings.twilio_verify_enabled:
+        try:
+            send_sms_verification(phone)
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+        return SendRegisterCodeResponse(expiresIn=OTP_TTL_SECONDS, resendAfter=RESEND_COOLDOWN_SECONDS)
 
     existing = (
         db.query(PhoneOtp)
@@ -243,24 +344,39 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
             status_code=409,
             detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
         )
-    try:
-        consume_register_code(db, phone, body.verificationCode.strip())
-    except ValueError as exc:
-        reason = str(exc)
-        if reason == "OTP_EXPIRED":
+    if settings.twilio_verify_partially_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TWILIO_NOT_CONFIGURED",
+                "message": "Twilio Verify env vars must all be set together",
+                "details": {},
+            },
+        )
+    if settings.twilio_verify_enabled:
+        try:
+            verify_sms_code(phone, body.verificationCode.strip())
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+    else:
+        try:
+            consume_register_code(db, phone, body.verificationCode.strip())
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "OTP_EXPIRED":
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "OTP_EXPIRED", "message": "Verification code expired", "details": {}},
+                ) from exc
+            if reason == "OTP_TOO_MANY_ATTEMPTS":
+                raise HTTPException(
+                    status_code=429,
+                    detail={"code": "OTP_TOO_MANY_ATTEMPTS", "message": "Too many invalid attempts", "details": {}},
+                ) from exc
             raise HTTPException(
                 status_code=400,
-                detail={"code": "OTP_EXPIRED", "message": "Verification code expired", "details": {}},
+                detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
             ) from exc
-        if reason == "OTP_TOO_MANY_ATTEMPTS":
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "OTP_TOO_MANY_ATTEMPTS", "message": "Too many invalid attempts", "details": {}},
-            ) from exc
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
-        ) from exc
 
     heishi_id = generate_heishi_id(db, phone)
     avatar_raw = body.avatarUrl.strip() if body.avatarUrl else ""
@@ -309,6 +425,21 @@ def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
             status_code=404,
             detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
         )
+    if settings.twilio_verify_partially_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TWILIO_NOT_CONFIGURED",
+                "message": "Twilio Verify env vars must all be set together",
+                "details": {},
+            },
+        )
+    if settings.twilio_verify_enabled:
+        try:
+            send_sms_verification(phone)
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+        return SendRegisterCodeResponse(expiresIn=OTP_TTL_SECONDS, resendAfter=RESEND_COOLDOWN_SECONDS)
     existing = (
         db.query(PhoneOtp)
         .filter(PhoneOtp.phone == phone, PhoneOtp.purpose == "login", PhoneOtp.consumed.is_(False))
@@ -346,24 +477,39 @@ def send_login_code(body: SendRegisterCodeRequest, db: Session = Depends(get_db)
 @router.post("/login/verify", response_model=AuthTokensDto)
 def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
     phone = _require_valid_phone(body.phone)
-    try:
-        consume_login_code(db, phone, body.verificationCode.strip())
-    except ValueError as exc:
-        reason = str(exc)
-        if reason == "OTP_EXPIRED":
+    if settings.twilio_verify_partially_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TWILIO_NOT_CONFIGURED",
+                "message": "Twilio Verify env vars must all be set together",
+                "details": {},
+            },
+        )
+    if settings.twilio_verify_enabled:
+        try:
+            verify_sms_code(phone, body.verificationCode.strip())
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+    else:
+        try:
+            consume_login_code(db, phone, body.verificationCode.strip())
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "OTP_EXPIRED":
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "OTP_EXPIRED", "message": "Verification code expired", "details": {}},
+                ) from exc
+            if reason == "OTP_TOO_MANY_ATTEMPTS":
+                raise HTTPException(
+                    status_code=429,
+                    detail={"code": "OTP_TOO_MANY_ATTEMPTS", "message": "Too many invalid attempts", "details": {}},
+                ) from exc
             raise HTTPException(
                 status_code=400,
-                detail={"code": "OTP_EXPIRED", "message": "Verification code expired", "details": {}},
+                detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
             ) from exc
-        if reason == "OTP_TOO_MANY_ATTEMPTS":
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "OTP_TOO_MANY_ATTEMPTS", "message": "Too many invalid attempts", "details": {}},
-            ) from exc
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "OTP_INVALID", "message": "Invalid verification code", "details": {}},
-        ) from exc
     user = db.query(User).filter(User.phone == phone).first()
     if not user:
         raise HTTPException(

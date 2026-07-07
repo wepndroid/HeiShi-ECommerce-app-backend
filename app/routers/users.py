@@ -6,9 +6,10 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
-from app.catalog_helpers import get_or_create_settings
+from app.catalog_helpers import apply_public_listing_visibility_filter, get_or_create_settings
 from app.database import get_db
 from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, VerificationSubmission, ViewHistory
+from app.config import settings
 from app.schemas import (
     AddPaymentMethodRequest,
     AddPayoutMethodRequest,
@@ -18,6 +19,8 @@ from app.schemas import (
     AuthUserDto,
     BindVerificationRequest,
     CacheClearResponse,
+    ConnectOnboardingResponse,
+    ConnectStatusResponse,
     CreditProfileDto,
     DataExportDto,
     NotificationSettingsDto,
@@ -33,11 +36,13 @@ from app.schemas import (
     ReceivedReviewDto,
     PendingReviewOrderDto,
     SetDefaultMethodRequest,
+    SetupIntentResponse,
     TransactionReminderSettingsDto,
     UserProfileUpdateRequest,
     VerificationStatusDto,
     VerificationSubmitRequest,
 )
+from app import stripe_service
 from app.pagination import paginate
 from app.routers.region_safety import REGION_DATA
 from app.serializers import (
@@ -469,9 +474,9 @@ def get_public_profile(user_id: str, request: Request, db: Session = Depends(get
     )
     avg_rating = float(review_row[0] or 0.0) if int(review_row[1] or 0) > 0 else 0.0
     review_count = int(review_row[1] or 0)
-    listing_count = (
-        db.query(Listing).filter(Listing.seller_id == user.id, Listing.status == "active").count()
-    )
+    listing_count = apply_public_listing_visibility_filter(
+        db.query(Listing).filter(Listing.seller_id == user.id)
+    ).count()
     follower_count = db.query(Follow).filter(Follow.followed_id == user.id).count()
     settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
     return public_user_profile(
@@ -503,9 +508,10 @@ def get_public_listings(
     q = (
         db.query(Listing)
         .options(joinedload(Listing.seller))
-        .filter(Listing.seller_id == user.id, Listing.status == "active")
+        .filter(Listing.seller_id == user.id)
         .order_by(Listing.created_at.desc())
     )
+    q = apply_public_listing_visibility_filter(q)
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
     return paginate([listing_to_summary(i, lang) for i in items], page, pageSize, total)
@@ -517,29 +523,125 @@ def list_payment_methods(user: User = Depends(get_current_user), db: Session = D
     return [payment_to_dto(m) for m in methods]
 
 
+_WALLET_LABELS = {
+    "apple_pay": "Apple Pay",
+    "google_pay": "Google Pay",
+    "alipay": "Alipay",
+    "wechat_pay": "WeChat Pay",
+    "paypal": "PayPal",
+}
+
+
+@payments_router.post("/setup-intent", response_model=SetupIntentResponse)
+def create_payment_setup_intent(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Bootstrap the mobile PaymentSheet to save a card for reuse. When Stripe is not
+    configured, returns a `simulated` response so the app can fall back to demo add."""
+    if not settings.stripe_enabled:
+        return SetupIntentResponse(
+            publishableKey="",
+            customerId=f"cus_sim_{user.id[:8]}",
+            ephemeralKey="",
+            setupIntentClientSecret="",
+            simulated=True,
+        )
+    customer_id = stripe_service.ensure_customer(user)
+    if user.stripe_customer_id != customer_id:
+        user.stripe_customer_id = customer_id
+        db.commit()
+    data = stripe_service.create_setup_intent(customer_id)
+    return SetupIntentResponse(**data, simulated=False)
+
+
 @payments_router.post("/methods", response_model=PaymentMethodDto, status_code=201)
 def add_payment_method(body: AddPaymentMethodRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    last4 = body.token[-4:] if len(body.token) >= 4 else "0000"
-    labels = {
-        "card": f"Card •••• {last4}",
-        "apple_pay": "Apple Pay",
-        "google_pay": "Google Pay",
-        "alipay": "Alipay",
-        "wechat_pay": "WeChat Pay",
-        "paypal": "PayPal",
-    }
+    """Persist a connected payment method. Real path: verify the pm_... from a confirmed
+    SetupIntent with Stripe and pull the true brand/last4/expiry. Simulated path: store a
+    stand-in from `token` so offline dev keeps working."""
+    brand = exp_month = exp_year = stripe_pm_id = last4 = None
+
+    if settings.stripe_enabled and body.stripePaymentMethodId:
+        try:
+            pm_obj = stripe_service.retrieve_payment_method(body.stripePaymentMethodId)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "PAYMENT_METHOD_INVALID", "message": "Could not verify the payment method with Stripe", "details": {}},
+            )
+        stripe_pm_id = pm_obj.get("id")
+        card = pm_obj.get("card") or {}
+        brand, last4 = card.get("brand"), card.get("last4")
+        exp_month, exp_year = card.get("exp_month"), card.get("exp_year")
+        if not user.stripe_customer_id:
+            user.stripe_customer_id = stripe_service.ensure_customer(user)
+    else:
+        token = body.token or ""
+        last4 = token[-4:] if len(token) >= 4 else "0000"
+
+    if body.type == "card":
+        label = f"{brand.title()} •••• {last4}" if brand and last4 else (f"Card •••• {last4}" if last4 else "Card")
+    else:
+        label = _WALLET_LABELS.get(body.type, body.type)
+
     count = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).count()
     pm = PaymentMethod(
         user_id=user.id,
         type=body.type,
-        label=labels.get(body.type, body.type),
+        label=label,
         last4=last4 if body.type == "card" else None,
+        brand=brand,
+        exp_month=exp_month,
+        exp_year=exp_year,
+        stripe_payment_method_id=stripe_pm_id,
         is_default=count == 0,
     )
     db.add(pm)
     db.commit()
     db.refresh(pm)
     return payment_to_dto(pm)
+
+
+@payments_router.post("/methods/sync", response_model=list[PaymentMethodDto])
+def sync_payment_methods(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Reconcile saved cards with Stripe after a PaymentSheet SetupIntent completes
+    (PaymentSheet doesn't return the pm id to the app). No-op without Stripe."""
+    if not settings.stripe_enabled or not user.stripe_customer_id:
+        return [payment_to_dto(m) for m in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()]
+    try:
+        stripe_pms = stripe_service.list_card_payment_methods(user.stripe_customer_id)
+    except Exception:
+        stripe_pms = []
+    existing = {
+        m.stripe_payment_method_id: m
+        for m in db.query(PaymentMethod).filter(
+            PaymentMethod.user_id == user.id, PaymentMethod.stripe_payment_method_id.isnot(None)
+        ).all()
+    }
+    has_any = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).count() > 0
+    for spm in stripe_pms:
+        pmid = spm.get("id")
+        card = spm.get("card") or {}
+        brand, last4 = card.get("brand"), card.get("last4")
+        if pmid in existing:
+            row = existing[pmid]
+            row.brand, row.last4 = brand, last4
+            row.exp_month, row.exp_year = card.get("exp_month"), card.get("exp_year")
+        else:
+            db.add(
+                PaymentMethod(
+                    user_id=user.id,
+                    type="card",
+                    label=f"{brand.title()} •••• {last4}" if brand and last4 else "Card",
+                    last4=last4,
+                    brand=brand,
+                    exp_month=card.get("exp_month"),
+                    exp_year=card.get("exp_year"),
+                    stripe_payment_method_id=pmid,
+                    is_default=not has_any,
+                )
+            )
+            has_any = True
+    db.commit()
+    return [payment_to_dto(m) for m in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()]
 
 
 @payments_router.delete("/methods/{method_id}", status_code=204)
@@ -551,8 +653,18 @@ def remove_payment_method(
     pm = db.query(PaymentMethod).filter(PaymentMethod.id == method_id, PaymentMethod.user_id == user.id).first()
     if not pm:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payment method not found", "details": {}})
+    if settings.stripe_enabled and getattr(pm, "stripe_payment_method_id", None):
+        stripe_service.detach_payment_method(pm.stripe_payment_method_id)
+    was_default = pm.is_default
     db.delete(pm)
     db.commit()
+    if was_default:
+        remaining = (
+            db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).order_by(PaymentMethod.id.asc()).first()
+        )
+        if remaining:
+            remaining.is_default = True
+            db.commit()
     return Response(status_code=204)
 
 
@@ -648,6 +760,50 @@ def set_default_payout_method(
     db.commit()
     db.refresh(pm)
     return payout_to_dto(pm)
+
+
+@payouts_router.post("/connect/link", response_model=ConnectOnboardingResponse)
+def create_payout_onboarding_link(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Create/return a Stripe Connect Express onboarding URL for bank payouts. When Stripe
+    is not configured, returns `simulated` so the app can fall back to the demo add flow."""
+    if not settings.stripe_enabled:
+        return ConnectOnboardingResponse(url="", simulated=True)
+    account_id = stripe_service.ensure_connect_account(user)
+    if user.stripe_connect_id != account_id:
+        user.stripe_connect_id = account_id
+        db.commit()
+    url = stripe_service.create_account_onboarding_link(account_id)
+    return ConnectOnboardingResponse(url=url, simulated=False)
+
+
+@payouts_router.get("/connect/status", response_model=ConnectStatusResponse)
+def get_payout_connect_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Poll the connected account after onboarding; syncs a `bank` payout row once the
+    seller's payouts are enabled so the payout list reflects the real bank account."""
+    if not settings.stripe_enabled or not user.stripe_connect_id:
+        return ConnectStatusResponse(connected=False, detailsSubmitted=False, payoutsEnabled=False)
+    account = stripe_service.retrieve_account(user.stripe_connect_id)
+    details = bool(account.get("details_submitted"))
+    payouts_enabled = bool(account.get("payouts_enabled"))
+    if details:
+        external = (account.get("external_accounts") or {}).get("data") or []
+        last4 = external[0].get("last4") if external else None
+        bank = (
+            db.query(PayoutMethod)
+            .filter(PayoutMethod.user_id == user.id, PayoutMethod.type == "bank")
+            .first()
+        )
+        if not bank:
+            count = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).count()
+            bank = PayoutMethod(user_id=user.id, type="bank", label="Bank (Stripe)", is_default=count == 0)
+            db.add(bank)
+        bank.stripe_external_account_id = user.stripe_connect_id
+        bank.payouts_enabled = payouts_enabled
+        if last4:
+            bank.last4 = last4
+            bank.label = f"Bank •••• {last4}"
+        db.commit()
+    return ConnectStatusResponse(connected=True, detailsSubmitted=details, payoutsEnabled=payouts_enabled)
 
 
 @settings_router.get("/notifications", response_model=NotificationSettingsDto)

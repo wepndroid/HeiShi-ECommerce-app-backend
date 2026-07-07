@@ -244,6 +244,16 @@ def create_listing(
     db: Session = Depends(get_db),
 ):
     is_draft = body.status == "draft"
+    # Admin publish-restriction (限制发布): blocks publishing new listings; drafts still allowed.
+    if not is_draft and getattr(user, "publish_restricted", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PUBLISH_RESTRICTED",
+                "message": "Publishing is restricted on this account",
+                "details": {},
+            },
+        )
     if not is_draft and not body.imageUrls:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "At least one image required", "details": {}})
     if body.imageUrls:

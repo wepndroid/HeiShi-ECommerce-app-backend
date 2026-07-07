@@ -31,7 +31,9 @@
 CREATE TABLE IF NOT EXISTS users (
     id              VARCHAR(36) PRIMARY KEY,
     nickname        VARCHAR(50) NOT NULL,
-    phone           VARCHAR(20) NOT NULL UNIQUE,
+    -- Nullable: OAuth (Google/Apple/WeChat) users have no phone at sign-up.
+    phone           VARCHAR(20) UNIQUE,
+    email           VARCHAR(255),
     password_hash   VARCHAR(255) NOT NULL,
     avatar_url      VARCHAR(500),
     bio             TEXT,
@@ -47,6 +49,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS ix_users_phone ON users (phone);
+CREATE INDEX IF NOT EXISTS ix_users_email ON users (email);
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id          VARCHAR(36) PRIMARY KEY,
@@ -207,23 +210,29 @@ CREATE TABLE IF NOT EXISTS addresses (
 CREATE INDEX IF NOT EXISTS ix_addresses_user_id ON addresses (user_id);
 
 CREATE TABLE IF NOT EXISTS payment_methods (
-    id         VARCHAR(36) PRIMARY KEY,
-    user_id    VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type       VARCHAR(20) NOT NULL,
-    label      VARCHAR(100) NOT NULL,
-    last4      VARCHAR(4),
-    is_default  BOOLEAN NOT NULL DEFAULT FALSE
+    id                        VARCHAR(36) PRIMARY KEY,
+    user_id                   VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type                      VARCHAR(20) NOT NULL,
+    label                     VARCHAR(100) NOT NULL,
+    last4                     VARCHAR(4),
+    is_default                BOOLEAN NOT NULL DEFAULT FALSE,
+    stripe_payment_method_id  VARCHAR(100),
+    brand                     VARCHAR(20),
+    exp_month                 INTEGER,
+    exp_year                  INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS ix_payment_methods_user_id ON payment_methods (user_id);
 
 CREATE TABLE IF NOT EXISTS payout_methods (
-    id         VARCHAR(36) PRIMARY KEY,
-    user_id    VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type       VARCHAR(20) NOT NULL,
-    label      VARCHAR(100) NOT NULL,
-    last4      VARCHAR(4),
-    is_default  BOOLEAN NOT NULL DEFAULT FALSE
+    id                          VARCHAR(36) PRIMARY KEY,
+    user_id                     VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type                        VARCHAR(20) NOT NULL,
+    label                       VARCHAR(100) NOT NULL,
+    last4                       VARCHAR(4),
+    is_default                  BOOLEAN NOT NULL DEFAULT FALSE,
+    stripe_external_account_id  VARCHAR(100),
+    payouts_enabled             BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS ix_payout_methods_user_id ON payout_methods (user_id);

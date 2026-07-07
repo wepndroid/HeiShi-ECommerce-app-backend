@@ -20,20 +20,58 @@ class Settings(BaseSettings):
     # OTP as `devCode` (no real SMS provider wired yet). Set false in production once Twilio
     # is configured so codes are delivered by SMS only.
     expose_dev_otp: bool = True
+    # Payments. When a Stripe secret key is present the real Stripe flow (SetupIntent /
+    # PaymentSheet / Connect / PaymentIntent) activates; otherwise the API simulates
+    # payments so local/offline dev keeps working. `payments_simulated` force-simulates
+    # even if a key is set (handy for staging). Effective real mode = stripe_enabled.
     payments_simulated: bool = True
     stripe_secret_key: str = ""
+    stripe_publishable_key: str = ""
     stripe_webhook_secret: str = ""
+    default_charge_currency: str = "aud"
+    # Stripe Connect onboarding return/refresh deep links (app scheme). Overridable per env.
+    connect_return_url: str = "heishi://payout/connect/return"
+    connect_refresh_url: str = "heishi://payout/connect/refresh"
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
+
+    @property
+    def stripe_enabled(self) -> bool:
+        """Real Stripe integration (SetupIntent/PaymentSheet, Connect, PaymentIntent) is
+        live when a secret key is present and simulation is off — the same switch the
+        checkout adapters use (`payments_simulated`). To go live the client provides the
+        keys and sets `payments_simulated=false`; otherwise the API simulates so local
+        dev keeps working."""
+        return bool(self.stripe_secret_key.strip()) and not self.payments_simulated
 
     # Supabase Auth (Path A — phone OTP). When jwt_secret is set, API accepts Supabase JWTs.
     supabase_url: str = ""
     supabase_jwt_secret: str = ""
     supabase_service_role_key: str = ""
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_verify_service_sid: str = ""
 
     @property
     def supabase_auth_enabled(self) -> bool:
         return bool(self.supabase_jwt_secret.strip())
+
+    @property
+    def twilio_verify_enabled(self) -> bool:
+        return bool(
+            self.twilio_account_sid.strip()
+            and self.twilio_auth_token.strip()
+            and self.twilio_verify_service_sid.strip()
+        )
+
+    @property
+    def twilio_verify_partially_configured(self) -> bool:
+        values = [
+            self.twilio_account_sid.strip(),
+            self.twilio_auth_token.strip(),
+            self.twilio_verify_service_sid.strip(),
+        ]
+        return any(values) and not self.twilio_verify_enabled
 
     @property
     def cors_origin_list(self) -> list[str]:

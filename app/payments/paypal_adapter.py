@@ -30,8 +30,16 @@ class PayPalAdapter:
         return response.json()["access_token"]
 
     def create_checkout(
-        self, *, order_id: int, amount_minor: int, currency: str, buyer_id: str
+        self,
+        *,
+        order_id: int,
+        amount_minor: int,
+        currency: str,
+        buyer_id: str,
+        customer_id: str | None = None,
+        payment_method_id: str | None = None,
     ) -> CheckoutResult:
+        # customer_id / payment_method_id are Stripe-only; PayPal ignores them.
         if not settings.paypal_client_id.strip():
             token = f"sim_{order_id}"
             return CheckoutResult(

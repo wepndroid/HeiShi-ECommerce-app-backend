@@ -44,3 +44,36 @@ def phone_from_claims(claims: dict[str, Any]) -> str | None:
         if isinstance(meta_phone, str) and meta_phone.strip():
             return meta_phone.strip()
     return None
+
+
+def email_from_claims(claims: dict[str, Any]) -> str | None:
+    email = claims.get("email")
+    if isinstance(email, str) and email.strip():
+        return email.strip().lower()
+    meta = claims.get("user_metadata")
+    if isinstance(meta, dict):
+        meta_email = meta.get("email")
+        if isinstance(meta_email, str) and meta_email.strip():
+            return meta_email.strip().lower()
+    return None
+
+
+def name_from_claims(claims: dict[str, Any]) -> str | None:
+    """Best-effort display name from OAuth provider metadata (Google/Apple/WeChat)."""
+    meta = claims.get("user_metadata")
+    if isinstance(meta, dict):
+        for key in ("full_name", "name", "user_name", "preferred_username", "nickname"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def avatar_from_claims(claims: dict[str, Any]) -> str | None:
+    meta = claims.get("user_metadata")
+    if isinstance(meta, dict):
+        for key in ("avatar_url", "picture"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+                return value.strip()
+    return None

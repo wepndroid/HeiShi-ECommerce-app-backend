@@ -140,6 +140,7 @@ def run_migrations(engine: Engine) -> None:
     if not str(engine.url).startswith("sqlite"):
         return
 
+    _sqlite_add_column_if_missing(engine, "users", "email", "email VARCHAR(255)")
     _sqlite_add_column_if_missing(engine, "system_notifications", "category", "category VARCHAR(20) DEFAULT 'system'")
     _sqlite_add_column_if_missing(engine, "system_notifications", "title_zh", "title_zh VARCHAR(200)")
     _sqlite_add_column_if_missing(engine, "system_notifications", "body_zh", "body_zh TEXT")
@@ -180,6 +181,21 @@ def run_migrations(engine: Engine) -> None:
 
     _sqlite_migrate_reviews_dual_party(engine)
 
+    # Stripe payments drop-in: buyer Customer + saved-card metadata + Connect payout status.
+    _sqlite_add_column_if_missing(engine, "users", "stripe_customer_id", "stripe_customer_id VARCHAR(100)")
+    for col, ddl in (
+        ("stripe_payment_method_id", "stripe_payment_method_id VARCHAR(100)"),
+        ("brand", "brand VARCHAR(20)"),
+        ("exp_month", "exp_month INTEGER"),
+        ("exp_year", "exp_year INTEGER"),
+    ):
+        _sqlite_add_column_if_missing(engine, "payment_methods", col, ddl)
+    for col, ddl in (
+        ("stripe_external_account_id", "stripe_external_account_id VARCHAR(100)"),
+        ("payouts_enabled", "payouts_enabled BOOLEAN DEFAULT 0"),
+    ):
+        _sqlite_add_column_if_missing(engine, "payout_methods", col, ddl)
+
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -189,6 +205,42 @@ def run_migrations(engine: Engine) -> None:
         )
 
     _sqlite_migrate_mvp_admin(engine)
+    _sqlite_migrate_mvp_admin_v2(engine)
+
+
+def _sqlite_migrate_mvp_admin_v2(engine: Engine) -> None:
+    """Admin MVP alignment: user moderation controls, category display, review moderation.
+
+    New tables (report_reasons, product_tags, search_logs, platform_settings) are created
+    automatically by Base.metadata.create_all; only added columns need backfilling here.
+    """
+
+    user_cols = (
+        ("is_muted", "is_muted BOOLEAN DEFAULT 0"),
+        ("muted_at", "muted_at DATETIME"),
+        ("mute_reason", "mute_reason TEXT"),
+        ("publish_restricted", "publish_restricted BOOLEAN DEFAULT 0"),
+        ("publish_restricted_at", "publish_restricted_at DATETIME"),
+        ("publish_restrict_reason", "publish_restrict_reason TEXT"),
+        ("is_flagged", "is_flagged BOOLEAN DEFAULT 0"),
+        ("flag_reason", "flag_reason TEXT"),
+        ("email_verified", "email_verified BOOLEAN DEFAULT 0"),
+    )
+    for col, ddl in user_cols:
+        _sqlite_add_column_if_missing(engine, "users", col, ddl)
+
+    for col, ddl in (
+        ("icon", "icon VARCHAR(50)"),
+        ("show_on_home", "show_on_home BOOLEAN DEFAULT 1"),
+    ):
+        _sqlite_add_column_if_missing(engine, "platform_categories", col, ddl)
+
+    for col, ddl in (
+        ("is_hidden", "is_hidden BOOLEAN DEFAULT 0"),
+        ("is_removed", "is_removed BOOLEAN DEFAULT 0"),
+        ("admin_note", "admin_note TEXT"),
+    ):
+        _sqlite_add_column_if_missing(engine, "reviews", col, ddl)
 
 
 def _sqlite_migrate_mvp_admin(engine: Engine) -> None:

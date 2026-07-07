@@ -66,7 +66,8 @@ class RefreshRequest(BaseModel):
 class AuthUserDto(BaseModel):
     id: str
     nickname: str
-    phone: str
+    phone: str | None = None
+    email: str | None = None
     avatarUrl: str | None = None
     bio: str | None = None
     city: str | None = None
@@ -79,6 +80,12 @@ class AuthTokensDto(BaseModel):
     refreshToken: str
     expiresIn: int
     user: AuthUserDto
+
+
+class OAuthProvisionRequest(BaseModel):
+    """Optional overrides when provisioning an OAuth user; all fields default from JWT claims."""
+    nickname: str | None = None
+    city: str | None = None
 
 
 # Catalog
@@ -108,6 +115,7 @@ class ListingSummaryDto(BaseModel):
     seller: SellerDto
     status: Literal["active", "draft", "sold", "inactive"]
     reviewStatus: Literal["pendingReview", "approved", "rejected", "removed", "draft"] = "approved"
+    reviewNote: str | None = None
     createdAt: str
     favoriteCount: int | None = None
     isPinned: bool | None = None
@@ -499,12 +507,27 @@ class PaymentMethodDto(BaseModel):
     type: Literal["card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal"]
     label: str
     last4: str | None = None
+    brand: str | None = None
+    expMonth: int | None = None
+    expYear: int | None = None
     isDefault: bool | None = None
 
 
 class AddPaymentMethodRequest(BaseModel):
     type: Literal["card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal"]
-    token: str
+    # Real path: the pm_... id from a confirmed SetupIntent (PaymentSheet). Simulated
+    # path (no Stripe key / offline dev): a stand-in token. One of the two is required.
+    stripePaymentMethodId: str | None = None
+    token: str | None = None
+
+
+class SetupIntentResponse(BaseModel):
+    """Everything the mobile PaymentSheet needs to save a card for reuse."""
+    publishableKey: str
+    customerId: str
+    ephemeralKey: str
+    setupIntentClientSecret: str
+    simulated: bool = False
 
 
 class PayoutMethodDto(BaseModel):
@@ -512,12 +535,25 @@ class PayoutMethodDto(BaseModel):
     type: Literal["bank", "paypal", "alipay", "wechat"]
     label: str
     last4: str | None = None
+    payoutsEnabled: bool | None = None
     isDefault: bool | None = None
 
 
 class AddPayoutMethodRequest(BaseModel):
     type: Literal["bank", "paypal", "alipay", "wechat"]
     accountToken: str
+
+
+class ConnectOnboardingResponse(BaseModel):
+    """URL the app opens for Stripe Connect Express payout onboarding."""
+    url: str
+    simulated: bool = False
+
+
+class ConnectStatusResponse(BaseModel):
+    connected: bool
+    detailsSubmitted: bool
+    payoutsEnabled: bool
 
 
 class NotificationSettingsDto(BaseModel):

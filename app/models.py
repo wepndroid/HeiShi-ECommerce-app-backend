@@ -39,7 +39,10 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     nickname: Mapped[str] = mapped_column(String(50))
-    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    # Nullable: OAuth (Google/Apple/WeChat) users have no phone at sign-up. UNIQUE still
+    # holds because SQLite/Postgres allow multiple NULLs in a unique column.
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -47,6 +50,7 @@ class User(Base):
     language: Mapped[str] = mapped_column(String(5), default="en")
     heishi_id: Mapped[str] = mapped_column(String(20), unique=True)
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     wechat_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     alipay_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     identity_verified: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -56,7 +60,19 @@ class User(Base):
     admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     banned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Moderation controls (admin MVP): mute silences chat, publish-restrict blocks new
+    # listings, flag marks the account abnormal for risk review. Each keeps its own reason.
+    is_muted: Mapped[bool] = mapped_column(Boolean, default=False)
+    muted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mute_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    publish_restricted: Mapped[bool] = mapped_column(Boolean, default=False)
+    publish_restricted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    publish_restrict_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
+    flag_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     stripe_connect_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Buyer-side Stripe Customer (holds saved cards/wallets for PaymentSheet reuse).
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     preferred_display_currency: Mapped[str] = mapped_column(String(3), default="aud")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -305,6 +321,11 @@ class PaymentMethod(Base):
     label: Mapped[str] = mapped_column(String(100))
     last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Stripe PaymentMethod (pm_...) attached to the user's Customer; set on the real path.
+    stripe_payment_method_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    brand: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    exp_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    exp_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class PayoutMethod(Base):
@@ -316,6 +337,10 @@ class PayoutMethod(Base):
     label: Mapped[str] = mapped_column(String(100))
     last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Stripe Connect linkage for bank payouts. `payouts_enabled` mirrors the connected
+    # account's status once onboarding (details_submitted + payouts_enabled) completes.
+    stripe_external_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payouts_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class UserSettings(Base):
@@ -414,6 +439,11 @@ class Review(Base):
     expertise_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     professionalism_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hire_again_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Moderation: hide keeps the review in the DB but pulls it from public view;
+    # removed is a soft-delete for violating content. Admin note records the reason.
+    is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_removed: Mapped[bool] = mapped_column(Boolean, default=False)
+    admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -470,6 +500,9 @@ class PlatformCategory(Base):
     label_zh: Mapped[str] = mapped_column(String(100))
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Category icon key (mobile renders it) and whether the category appears on the home grid.
+    icon: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    show_on_home: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class PlatformBanner(Base):
@@ -482,6 +515,26 @@ class PlatformBanner(Base):
     position: Mapped[str] = mapped_column(String(20), default="home")
     online_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     offline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlatformTopic(Base):
+    """专题 (topic zone) — a curated feature area, e.g. graduation clearance. Distinct from banners."""
+
+    __tablename__ = "platform_topics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(200))
+    title_zh: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    subtitle: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    cover_image_url: Mapped[str] = mapped_column(String(500), default="")
+    # Optional filter that drives the zone's contents (e.g. a product tag key like "graduation").
+    tag_key: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    link_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    online_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -527,3 +580,50 @@ class DailyActiveUserHit(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(36), index=True)
     day: Mapped[str] = mapped_column(String(10), index=True)
+
+
+class ReportReason(Base):
+    """Admin-configurable report reasons (举报原因配置) shared by mobile report sheet + web."""
+
+    __tablename__ = "report_reasons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(50), unique=True)
+    label_en: Mapped[str] = mapped_column(String(100))
+    label_zh: Mapped[str] = mapped_column(String(100))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ProductTag(Base):
+    """Admin-configurable listing tags (商品标签) selectable on a listing."""
+
+    __tablename__ = "product_tags"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(50), unique=True)
+    label_en: Mapped[str] = mapped_column(String(100))
+    label_zh: Mapped[str] = mapped_column(String(100))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class SearchLog(Base):
+    """One row per search submitted, aggregated into 热门搜索词 (popular search terms)."""
+
+    __tablename__ = "search_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    term: Mapped[str] = mapped_column(String(120), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlatformSetting(Base):
+    """Generic key/value store for 系统配置: home-module switches, user agreement, privacy policy."""
+
+    __tablename__ = "platform_settings"
+
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

@@ -23,7 +23,7 @@ from app.database import get_db
 from app.form_options import LISTING_FORM_OPTIONS
 from app.image_search import hamming_distance, hash_image_bytes, hash_image_url, is_similar_enough
 from app.media_urls import normalize_media_url, normalize_media_urls
-from app.models import Favorite, Listing, Order, Review, User, ViewHistory
+from app.models import Favorite, Listing, Order, Review, SearchLog, User, ViewHistory
 from app.pagination import paginate
 from app.schemas import (
     ImageSearchResponseDto,
@@ -278,6 +278,10 @@ def search(
     query = apply_search(query, q, sort)
     total = query.count()
     items = query.offset((page - 1) * pageSize).limit(pageSize).all()
+    # Log the term (first page only) so the admin data board can surface 热门搜索词.
+    if q and q.strip() and page == 1:
+        db.add(SearchLog(term=q.strip()[:120].lower(), user_id=viewer_id))
+        db.commit()
     return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
 
 
@@ -293,6 +297,11 @@ def get_listing(
         db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.id == listing_id).first()
     )
     if not listing or not _user_can_view_inactive_listing(db, listing, user):
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
+    if listing.review_status != "approved":
+        if not user or listing.seller_id != user.id:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
+    elif listing.status != "active" and not _user_can_view_inactive_listing(db, listing, user):
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
     if user and listing.seller_id != user.id and users_blocked(db, user.id, listing.seller_id):
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
