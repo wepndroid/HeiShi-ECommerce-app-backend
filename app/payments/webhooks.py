@@ -72,6 +72,12 @@ def handle_paypal_webhook(db: Session, payload: dict) -> bool:
                 if ref:
                     order = _order_by_metadata(db, int(ref))
                     break
+        if event_type == "CHECKOUT.ORDER.APPROVED":
+            if order and order.status == "pendingPay":
+                order.payment_status = "approved"
+                order.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            return True
         if order and order.status == "pendingPay":
             order.payment_status = "succeeded"
             order.psp_transaction_id = psp_id

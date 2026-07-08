@@ -130,21 +130,25 @@ def create_and_confirm_payment_intent(
     payment_method_id: str,
     description: str | None = None,
     metadata: dict | None = None,
+    transfer_group: str | None = None,
 ) -> dict:
     """Charge the buyer's saved payment method. Returns the PaymentIntent; the caller
     inspects ``status`` (``succeeded`` / ``requires_action`` / ``requires_payment_method``)."""
     s = _client()
-    return s.PaymentIntent.create(
-        amount=amount_minor,
-        currency=currency,
-        customer=customer_id,
-        payment_method=payment_method_id,
-        confirm=True,
-        off_session=False,
-        description=description,
-        metadata=metadata or {},
-        automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
-    )
+    params: dict = {
+        "amount": amount_minor,
+        "currency": currency,
+        "customer": customer_id,
+        "payment_method": payment_method_id,
+        "confirm": True,
+        "off_session": False,
+        "description": description,
+        "metadata": metadata or {},
+        "automatic_payment_methods": {"enabled": True, "allow_redirects": "never"},
+    }
+    if transfer_group:
+        params["transfer_group"] = transfer_group
+    return s.PaymentIntent.create(**params)
 
 
 def retrieve_payment_intent(payment_intent_id: str) -> dict:
@@ -153,3 +157,76 @@ def retrieve_payment_intent(payment_intent_id: str) -> dict:
 
 def construct_webhook_event(payload: bytes, sig_header: str):
     return _client().Webhook.construct_event(payload, sig_header, settings.stripe_webhook_secret.strip())
+
+
+def retrieve_checkout_session(session_id: str) -> dict:
+    return _client().checkout.Session.retrieve(session_id)
+
+
+def resolve_transfer_source_transaction(reference_id: str) -> str | None:
+    """Resolve a PaymentIntent / Checkout Session to the underlying charge id."""
+    if not reference_id:
+        return None
+    if reference_id.startswith("cs_"):
+        session = retrieve_checkout_session(reference_id)
+        payment_intent_id = session.get("payment_intent")
+        if not payment_intent_id:
+            return None
+        intent = retrieve_payment_intent(payment_intent_id)
+    else:
+        intent = retrieve_payment_intent(reference_id)
+    latest_charge = intent.get("latest_charge")
+    if isinstance(latest_charge, str):
+        return latest_charge
+    if isinstance(latest_charge, dict):
+        return latest_charge.get("id")
+    return None
+
+
+def create_transfer(
+    *,
+    amount_minor: int,
+    currency: str,
+    destination_account_id: str,
+    source_transaction: str | None = None,
+    transfer_group: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    params: dict = {
+        "amount": amount_minor,
+        "currency": currency,
+        "destination": destination_account_id,
+        "metadata": metadata or {},
+    }
+    if source_transaction:
+        params["source_transaction"] = source_transaction
+    if transfer_group:
+        params["transfer_group"] = transfer_group
+    return _client().Transfer.create(**params)
+
+
+def create_transfer_reversal(
+    *,
+    transfer_id: str,
+    amount_minor: int | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    params: dict = {"metadata": metadata or {}}
+    if amount_minor is not None:
+        params["amount"] = amount_minor
+    return _client().Transfer.create_reversal(transfer_id, **params)
+
+
+def create_refund(
+    *,
+    payment_intent_id: str,
+    amount_minor: int | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    params: dict = {
+        "payment_intent": payment_intent_id,
+        "metadata": metadata or {},
+    }
+    if amount_minor is not None:
+        params["amount"] = amount_minor
+    return _client().Refund.create(**params)

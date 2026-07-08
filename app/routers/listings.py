@@ -13,6 +13,7 @@ from app.database import get_db
 from app.models import Conversation, Favorite, Listing, Order, User, ViewHistory
 from app.moderation import find_blocked_keyword
 from app.pagination import paginate
+from app.platform_config import escrow_fee_from_db
 from app.schemas import CreateListingRequest, ListingDetailDto, ListingSummaryDto, Paginated, UploadImageResponse, BundleItemRequest
 from app.serializers import listing_to_detail, listing_to_summary
 
@@ -89,6 +90,29 @@ _EXT_TO_TYPE = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+
+def _keyword_rejection_note(keyword: str) -> str:
+    return f"Rejected by keyword pre-check: contains blocked keyword '{keyword}'."
+
+
+def _apply_keyword_moderation(
+    db: Session,
+    listing: Listing,
+    *,
+    title: str,
+    description: str | None,
+    require_review_on_pass: bool,
+) -> str | None:
+    blocked = find_blocked_keyword(db, f"{title}\n{description or ''}")
+    if blocked:
+        listing.review_status = "rejected"
+        listing.review_note = _keyword_rejection_note(blocked)
+        return blocked
+    if require_review_on_pass and listing.status != "draft":
+        listing.review_status = "pendingReview"
+        listing.review_note = None
+    return None
 
 
 def _valid_media_url(url: str) -> bool:
@@ -209,7 +233,7 @@ def get_owned_listing(
     )
     if not listing:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
-    detail = listing_to_detail(listing, lang)
+    detail = listing_to_detail(listing, lang, escrow_fee=escrow_fee_from_db(db))
     purchase_available = compute_purchase_available(db, listing)
     return detail.model_copy(update={"purchaseAvailable": purchase_available})
 
@@ -277,17 +301,6 @@ def create_listing(
                 "details": {},
             },
         )
-    if not is_draft:
-        blocked = find_blocked_keyword(db, f"{body.title}\n{body.description or ''}")
-        if blocked:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "BLOCKED_CONTENT",
-                    "message": "Listing contains blocked content",
-                    "details": {"keyword": blocked},
-                },
-            )
     review_status = "draft" if is_draft else "pendingReview"
     service_icon = None
     if listing_type == "bundle":
@@ -331,6 +344,7 @@ def create_listing(
         region_area=body.locationLabel,
         status=status,
         review_status=review_status,
+        review_note=None,
     )
     listing.images = body.imageUrls
     listing.pickup_methods = body.pickupMethods or ["meetup"]
@@ -340,6 +354,14 @@ def create_listing(
     listing.bundle_meta = bundle_meta
     if service_icon:
         listing.service_icon = service_icon
+    if not is_draft:
+        _apply_keyword_moderation(
+            db,
+            listing,
+            title=body.title,
+            description=body.description,
+            require_review_on_pass=True,
+        )
     db.add(listing)
     db.commit()
     db.refresh(listing)
@@ -404,6 +426,8 @@ def update_listing(
         "tagKey": "tag_key",
         "locationLabel": "location_label",
     }
+    previous_status = listing.status
+    content_changed = False
     for key, val in data.items():
         if key == "type" and val is not None and val != listing.type:
             raise HTTPException(
@@ -489,10 +513,28 @@ def update_listing(
                 listing.status = val
         elif key in ("title", "description", "price"):
             setattr(listing, key, val)
+            if key in ("title", "description"):
+                content_changed = True
         elif key in field_map:
             setattr(listing, field_map[key], val)
             if key == "locationLabel" and val is not None:
                 listing.region_area = val
+    if listing.status != "draft" and (
+        content_changed
+        or (previous_status == "draft" and listing.status == "active")
+        or (
+            previous_status == "inactive"
+            and listing.status == "active"
+            and listing.review_status == "draft"
+        )
+    ):
+        _apply_keyword_moderation(
+            db,
+            listing,
+            title=listing.title,
+            description=listing.description,
+            require_review_on_pass=True,
+        )
     db.commit()
     db.refresh(listing)
     return listing_to_summary(listing)

@@ -191,6 +191,7 @@ def run_migrations(engine: Engine) -> None:
     ):
         _sqlite_add_column_if_missing(engine, "payment_methods", col, ddl)
     for col, ddl in (
+        ("account_ref", "account_ref VARCHAR(255)"),
         ("stripe_external_account_id", "stripe_external_account_id VARCHAR(100)"),
         ("payouts_enabled", "payouts_enabled BOOLEAN DEFAULT 0"),
     ):
@@ -206,6 +207,27 @@ def run_migrations(engine: Engine) -> None:
 
     _sqlite_migrate_mvp_admin(engine)
     _sqlite_migrate_mvp_admin_v2(engine)
+    _sqlite_migrate_escrow_fee_defaults(engine)
+
+
+def _sqlite_migrate_escrow_fee_defaults(engine: Engine) -> None:
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "orders" in tables:
+            conn.execute(text("UPDATE orders SET escrow_fee = 0 WHERE escrow_fee IS NULL OR escrow_fee != 0"))
+        if "platform_settings" in tables:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO platform_settings (key, value, updated_at)
+                    SELECT 'payments.escrowFee', '0', CURRENT_TIMESTAMP
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM platform_settings WHERE key = 'payments.escrowFee'
+                    )
+                    """
+                )
+            )
 
 
 def _sqlite_migrate_mvp_admin_v2(engine: Engine) -> None:
@@ -282,6 +304,16 @@ def _sqlite_migrate_mvp_admin(engine: Engine) -> None:
         ("amount_minor", "amount_minor INTEGER"),
         ("display_amount_cny", "display_amount_cny FLOAT"),
         ("payout_paused", "payout_paused BOOLEAN DEFAULT 0"),
+        ("payout_status", "payout_status VARCHAR(30) DEFAULT 'pending'"),
+        ("payout_provider", "payout_provider VARCHAR(20)"),
+        ("payout_method_id", "payout_method_id VARCHAR(36)"),
+        ("payout_reference", "payout_reference VARCHAR(100)"),
+        ("payout_failure_code", "payout_failure_code VARCHAR(50)"),
+        ("payout_failure_reason", "payout_failure_reason TEXT"),
+        ("payout_released_at", "payout_released_at DATETIME"),
+        ("payout_failed_at", "payout_failed_at DATETIME"),
+        ("payout_reversed_at", "payout_reversed_at DATETIME"),
+        ("payout_reversal_reference", "payout_reversal_reference VARCHAR(100)"),
         ("is_abnormal", "is_abnormal BOOLEAN DEFAULT 0"),
         ("admin_notes", "admin_notes TEXT"),
         ("dispute_status", "dispute_status VARCHAR(30)"),

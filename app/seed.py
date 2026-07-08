@@ -171,6 +171,7 @@ _DEFAULT_SETTINGS = {
     "home.module.categories": "on",
     "home.module.recommended": "on",
     "home.module.graduationZone": "on",
+    "payments.escrowFee": "0",
     "legal.userAgreement": "By using HeyMarket you agree to trade responsibly and follow all local laws.",
     "legal.privacyPolicy": "We collect only what is needed to run the marketplace and never sell your data.",
 }
@@ -228,8 +229,9 @@ def _seed_platform_config(db: Session) -> None:
     if not db.query(ProductTag).first():
         for idx, (key, en, zh) in enumerate(_PRODUCT_TAGS):
             db.add(ProductTag(key=key, label_en=en, label_zh=zh, sort_order=idx, active=True))
-    if not db.query(PlatformSetting).first():
-        for key, value in _DEFAULT_SETTINGS.items():
+    existing_setting_keys = {row.key for row in db.query(PlatformSetting).all()}
+    for key, value in _DEFAULT_SETTINGS.items():
+        if key not in existing_setting_keys:
             db.add(PlatformSetting(key=key, value=value))
     if not db.query(PlatformTopic).first():
         db.add(PlatformTopic(

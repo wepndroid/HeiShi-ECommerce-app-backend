@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.models import Order
+from app.payout_release import release_payout_for_order
 
 AUTO_CONFIRM_DAYS = 5
 
@@ -34,6 +35,7 @@ def process_auto_confirm_orders(db: Session) -> int:
         if order.dispute_status == "open":
             continue
         order.status = "pendingReview"
+        release_payout_for_order(db, order)
         order.confirmed_at = now
         order.updated_at = now
         count += 1

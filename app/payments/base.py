@@ -25,6 +25,7 @@ class PaymentAdapter(Protocol):
         amount_minor: int,
         currency: str,
         buyer_id: str,
+        payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
     ) -> CheckoutResult: ...

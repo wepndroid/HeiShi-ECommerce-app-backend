@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 
-from app.config import settings
 from app.avatar_photos import avatar_url_for_user_id
 from app.media_urls import normalize_media_url, normalize_media_urls
 from app.messaging_read import marked_as_unread, message_ack_read
@@ -232,7 +231,7 @@ def _infer_bundle_cover_urls(listing_images: list[str], items: list[dict]) -> li
     return exclusive if exclusive else [listing[0]]
 
 
-def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
+def listing_to_detail(listing: Listing, lang: str = "en", *, escrow_fee: float = 0.0) -> ListingDetailDto:
     summary = listing_to_summary(listing, lang)
     bundle_meta = None
     if listing.type == "bundle":
@@ -253,7 +252,7 @@ def listing_to_detail(listing: Listing, lang: str = "en") -> ListingDetailDto:
         escrowSupported=listing.escrow_supported,
         meetInPublic=listing.meet_in_public,
         pickupMethods=listing.pickup_methods,
-        escrowFee=settings.escrow_fee if listing.escrow_supported else 0.0,
+        escrowFee=escrow_fee if listing.escrow_supported else 0.0,
         viewCount=listing.view_count,
         bundleMeta=bundle_meta if bundle_meta else None,
         serviceIcon=listing.service_icon if listing.type == "service" else None,
@@ -409,14 +408,39 @@ def payment_to_dto(pm: PaymentMethod) -> PaymentMethodDto:
 def payout_to_dto(pm: PayoutMethod) -> PayoutMethodDto:
     allowed = ("bank", "paypal", "alipay", "wechat")
     pm_type = pm.type if pm.type in allowed else "bank"
+    label = pm.label
+    account_hint: str | None = None
+    raw_ref = getattr(pm, "account_ref", None)
+    if pm_type == "bank":
+        label = "Australian bank account"
+        account_hint = f"**** {pm.last4}" if pm.last4 else None
+    elif raw_ref:
+        account_hint = _mask_account_hint(pm_type, raw_ref)
     return PayoutMethodDto(
         id=pm.id,
         type=pm_type,
-        label=pm.label,
+        label=label,
         last4=pm.last4,
+        accountHint=account_hint,
         payoutsEnabled=getattr(pm, "payouts_enabled", None),
         isDefault=pm.is_default,
     )
+
+
+def _mask_account_hint(method_type: str, value: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return ""
+    if method_type == "paypal" and "@" in trimmed:
+        local, domain = trimmed.split("@", 1)
+        if len(local) <= 2:
+            masked_local = local[:1] + "***"
+        else:
+            masked_local = local[:2] + "***" + local[-1]
+        return f"{masked_local}@{domain}"
+    if len(trimmed) <= 4:
+        return trimmed[0] + "***"
+    return f"{trimmed[:2]}***{trimmed[-4:]}"
 
 
 def settings_to_notification(s: UserSettings) -> NotificationSettingsDto:

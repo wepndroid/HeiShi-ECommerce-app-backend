@@ -38,6 +38,8 @@ from app.models import (
     ViewHistory,
 )
 from app.media_urls import normalize_media_urls
+from app.payments.refunds import refund_order_payment
+from app.payout_release import release_payout_for_order, reverse_released_payout_for_order
 from app.serializers import user_to_dto, _user_avatar_url
 from app.schemas import AuthTokensDto, AuthUserDto
 
@@ -78,7 +80,7 @@ class ReportActionRequest(BaseModel):
 
 
 class DisputeResolveRequest(BaseModel):
-    resolution: str = Field(pattern="^(refund|complete|cancel)$")
+    resolution: str = Field(pattern="^(refund|complete)$")
     note: str = Field(default="", max_length=500)
 
 
@@ -442,6 +444,10 @@ def dashboard_stats(db: Session = Depends(get_db), admin: User = Depends(require
         "totalListings": db.query(func.count(Listing.id)).scalar() or 0,
         "activeListingCount": db.query(func.count(Listing.id)).filter(Listing.status == "active").scalar() or 0,
         "pendingReviewCount": db.query(func.count(Listing.id)).filter(Listing.review_status == "pendingReview").scalar() or 0,
+        "pendingProductCount": db.query(func.count(Listing.id))
+        .filter(Listing.review_status == "pendingReview", Listing.type == "product")
+        .scalar()
+        or 0,
         "reportCount": db.query(func.count(SafetyReport.id)).filter(SafetyReport.status == "pending").scalar() or 0,
         "orderCount": db.query(func.count(Order.id)).scalar() or 0,
         "completedTradeCount": db.query(func.count(Order.id)).filter(Order.status == "completed").scalar() or 0,
@@ -1202,9 +1208,29 @@ def pause_payout(order_id: int, db: Session = Depends(get_db), admin: User = Dep
     if not order:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Order not found", "details": {}})
     order.payout_paused = True
+    if getattr(order, "payout_status", None) not in ("released", "reversed"):
+        order.payout_status = "blocked"
+        order.payout_failure_code = "PAYOUT_PAUSED"
+        order.payout_failure_reason = "Payout was paused by an administrator"
     log_admin_action(db, admin_id=admin.id, action_type="pause_payout", target_type="order", target_id=order_id)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/orders/{order_id}/release-payout")
+def release_payout(order_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    order = _get_order_or_404(db, order_id)
+    transition = release_payout_for_order(db, order)
+    log_admin_action(
+        db,
+        admin_id=admin.id,
+        action_type="release_payout",
+        target_type="order",
+        target_id=order_id,
+        after={"status": transition.status, "code": transition.code, "reference": transition.reference},
+    )
+    db.commit()
+    return {"ok": True, "status": transition.status, "reference": transition.reference}
 
 
 def _order_admin_summary(row: Order) -> dict:
@@ -1225,6 +1251,16 @@ def _order_admin_summary(row: Order) -> dict:
         "pspTransactionId": row.psp_transaction_id,
         "pspPaymentId": row.psp_payment_id,
         "payoutPaused": row.payout_paused,
+        "payoutStatus": getattr(row, "payout_status", None),
+        "payoutProvider": getattr(row, "payout_provider", None),
+        "payoutMethodId": getattr(row, "payout_method_id", None),
+        "payoutReference": getattr(row, "payout_reference", None),
+        "payoutFailureCode": getattr(row, "payout_failure_code", None),
+        "payoutFailureReason": getattr(row, "payout_failure_reason", None),
+        "payoutReleasedAt": row.payout_released_at.isoformat() if getattr(row, "payout_released_at", None) else None,
+        "payoutFailedAt": row.payout_failed_at.isoformat() if getattr(row, "payout_failed_at", None) else None,
+        "payoutReversedAt": row.payout_reversed_at.isoformat() if getattr(row, "payout_reversed_at", None) else None,
+        "payoutReversalReference": getattr(row, "payout_reversal_reference", None),
         "isAbnormal": row.is_abnormal,
         "adminNotes": row.admin_notes,
         "disputeStatus": row.dispute_status,
@@ -1319,11 +1355,33 @@ def resolve_dispute(
     order.admin_notes = body.note or order.admin_notes
     order.dispute_status = "resolved"
     if body.resolution == "refund":
-        order.status = "refundInProgress"
+        payout_transition = reverse_released_payout_for_order(order)
+        if getattr(order, "payout_status", None) == "released" and payout_transition.status != "reversed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PAYOUT_REVERSAL_REQUIRED",
+                    "message": payout_transition.code or "Seller payout could not be reversed",
+                    "details": {"reason": payout_transition.reference or payout_transition.status},
+                },
+            )
+        refund_transition = refund_order_payment(order)
+        if refund_transition.status != "refunded":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": refund_transition.code or "REFUND_FAILED",
+                    "message": refund_transition.message or "Buyer payment could not be refunded",
+                    "details": {},
+                },
+            )
+        order.status = "cancelled"
+        order.payout_paused = False
     elif body.resolution == "complete":
         order.status = "completed"
-    else:
-        order.status = "cancelled"
+        order.payout_paused = False
+        release_payout_for_order(db, order)
+    order.updated_at = datetime.now(timezone.utc)
     log_admin_action(
         db,
         admin_id=admin.id,

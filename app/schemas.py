@@ -515,8 +515,7 @@ class PaymentMethodDto(BaseModel):
 
 class AddPaymentMethodRequest(BaseModel):
     type: Literal["card", "apple_pay", "google_pay", "alipay", "wechat_pay", "paypal"]
-    # Real path: the pm_... id from a confirmed SetupIntent (PaymentSheet). Simulated
-    # path (no Stripe key / offline dev): a stand-in token. One of the two is required.
+    # Real path: the pm_... id from a confirmed SetupIntent (PaymentSheet).
     stripePaymentMethodId: str | None = None
     token: str | None = None
 
@@ -535,13 +534,15 @@ class PayoutMethodDto(BaseModel):
     type: Literal["bank", "paypal", "alipay", "wechat"]
     label: str
     last4: str | None = None
+    accountHint: str | None = None
     payoutsEnabled: bool | None = None
     isDefault: bool | None = None
 
 
 class AddPayoutMethodRequest(BaseModel):
     type: Literal["bank", "paypal", "alipay", "wechat"]
-    accountToken: str
+    accountToken: str | None = None
+    accountRef: str | None = None
 
 
 class ConnectOnboardingResponse(BaseModel):

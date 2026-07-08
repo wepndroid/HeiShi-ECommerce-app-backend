@@ -27,6 +27,8 @@ from app.models import Coupon, Listing, Order, Review, User
 from app.order_jobs import schedule_auto_confirm
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
 from app.pagination import paginate
+from app.platform_config import escrow_fee_from_db
+from app.payout_release import release_payout_for_order
 from app.push_notifications import send_order_paid_push, send_order_remind_push
 from app.schemas import (
     CreateOrderRequest,
@@ -299,13 +301,14 @@ def create_order(
                 detail={"code": "INVALID_STATE", "message": "Listing is no longer available for purchase", "details": {}},
             )
     payable, discount, coupon_id = _apply_coupon(db, user.id, body.couponId, checkout_amount)
+    escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
     order = Order(
         buyer_id=user.id,
         listing_id=listing.id,
         seller_id=listing.seller_id,
         status="pendingPay",
         amount=payable,
-        escrow_fee=settings.escrow_fee if listing.escrow_supported else 0.0,
+        escrow_fee=escrow_fee,
         delivery_method=body.deliveryMethod,
         payment_method_id=body.paymentMethodId,
         bundle_item_id=bundle_item_id,
@@ -347,7 +350,7 @@ def update_order(
             base = bundle_item_separate_price(item) if item else order.amount + order.discount_amount
         else:
             base = listing_checkout_amount(listing)
-        order.escrow_fee = settings.escrow_fee if listing.escrow_supported else 0.0
+        order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
         coupon_id = patch["couponId"] if "couponId" in patch else order.coupon_id
         payable, discount, resolved_coupon = _apply_coupon(
             db, user.id, coupon_id, base, exclude_order_id=order.id
@@ -429,7 +432,7 @@ def pay_order(
         )
         order.amount = payable
         order.discount_amount = discount
-        order.escrow_fee = settings.escrow_fee if listing.escrow_supported else 0.0
+        order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
     fulfill_paid_order(db, order)
     db.refresh(order)
     paid_order = (
@@ -562,6 +565,8 @@ def confirm_receive(order_id: int, request: Request, user: User = Depends(get_cu
     if order.status not in ("pendingReceive", "pendingService"):
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Order is not pending confirmation", "details": {}})
     order.status = "pendingReview"
+    release_payout_for_order(db, order)
+    order.confirmed_at = datetime.now(timezone.utc)
     order.auto_confirm_at = None
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -572,6 +577,20 @@ def confirm_receive(order_id: int, request: Request, user: User = Depends(get_cu
 class OrderReasonRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
     evidenceUrls: list[str] = Field(default_factory=list)
+
+
+def _open_refund_style_dispute(
+    order: Order,
+    *,
+    reason: str,
+    evidence_urls: list[str],
+) -> None:
+    order.status = "refundInProgress"
+    order.payout_paused = True
+    order.dispute_status = "refund_requested"
+    order.dispute_reason = reason
+    order.dispute_evidence_json = json.dumps(evidence_urls[:10])
+    order.updated_at = datetime.now(timezone.utc)
 
 
 @router.post("/{order_id}/refund", response_model=OrderDto)
@@ -588,12 +607,7 @@ def request_refund(
             status_code=400,
             detail={"code": "INVALID_STATE", "message": "Refund cannot be requested for this order", "details": {}},
         )
-    order.status = "refundInProgress"
-    order.payout_paused = True
-    order.dispute_status = "refund_requested"
-    order.dispute_reason = body.reason
-    order.dispute_evidence_json = json.dumps(body.evidenceUrls[:10])
-    order.updated_at = datetime.now(timezone.utc)
+    _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
@@ -613,17 +627,12 @@ def open_dispute(
     db: Session = Depends(get_db),
 ):
     order = _get_buyer_order(db, order_id, user.id)
-    if order.status not in ("pendingShip", "pendingReceive", "pendingConfirm", "pendingService"):
+    if order.status not in ("pendingShip", "pendingService", "pendingReceive", "completed"):
         raise HTTPException(
             status_code=400,
             detail={"code": "INVALID_STATE", "message": "Order cannot enter dispute in current state", "details": {}},
         )
-    order.status = "inDispute"
-    order.payout_paused = True
-    order.dispute_status = "open"
-    order.dispute_reason = body.reason
-    order.dispute_evidence_json = json.dumps(body.evidenceUrls[:10])
-    order.updated_at = datetime.now(timezone.utc)
+    _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
@@ -735,6 +744,7 @@ def _maybe_complete_order_after_review(db: Session, order: Order) -> None:
     if review_count < 2 or order.status != "pendingReview":
         return
     order.status = "completed"
+    release_payout_for_order(db, order)
     order.updated_at = datetime.now(timezone.utc)
     listing = db.query(Listing).filter(Listing.id == order.listing_id).first()
     if listing and listing.status != "sold":

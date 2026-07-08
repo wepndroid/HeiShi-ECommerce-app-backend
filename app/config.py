@@ -1,8 +1,13 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parent.parent / ".env",
+        extra="ignore",
+    )
 
     database_url: str = "sqlite:///./heishi.db"
     jwt_secret: str = "dev-secret-change-in-production"
@@ -11,7 +16,7 @@ class Settings(BaseSettings):
     base_url: str = "http://127.0.0.1:8000"
     cors_origins: str = "*"
     upload_dir: str = "uploads"
-    escrow_fee: float = 0.99
+    escrow_fee: float = 0.0
     aud_to_cny_display_rate: float = 4.75
     pending_pay_expire_minutes: int = 30
     admin_seed_phone: str = "0499999001"
@@ -34,6 +39,14 @@ class Settings(BaseSettings):
     connect_refresh_url: str = "heishi://payout/connect/refresh"
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
+    alipay_app_id: str = ""
+    alipay_private_key: str = ""
+    alipay_public_key: str = ""
+    wechat_pay_app_id: str = ""
+    wechat_pay_mch_id: str = ""
+    wechat_pay_api_v3_key: str = ""
+    wechat_pay_serial_no: str = ""
+    wechat_pay_private_key: str = ""
 
     @property
     def stripe_enabled(self) -> bool:
@@ -43,6 +56,28 @@ class Settings(BaseSettings):
         keys and sets `payments_simulated=false`; otherwise the API simulates so local
         dev keeps working."""
         return bool(self.stripe_secret_key.strip()) and not self.payments_simulated
+
+    @property
+    def paypal_payout_enabled(self) -> bool:
+        return bool(self.paypal_client_id.strip() and self.paypal_client_secret.strip())
+
+    @property
+    def alipay_payout_enabled(self) -> bool:
+        return bool(
+            self.alipay_app_id.strip()
+            and self.alipay_private_key.strip()
+            and self.alipay_public_key.strip()
+        )
+
+    @property
+    def wechat_payout_enabled(self) -> bool:
+        return bool(
+            self.wechat_pay_app_id.strip()
+            and self.wechat_pay_mch_id.strip()
+            and self.wechat_pay_api_v3_key.strip()
+            and self.wechat_pay_serial_no.strip()
+            and self.wechat_pay_private_key.strip()
+        )
 
     # Supabase Auth (Path A — phone OTP). When jwt_secret is set, API accepts Supabase JWTs.
     supabase_url: str = ""

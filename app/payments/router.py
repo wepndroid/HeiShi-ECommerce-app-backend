@@ -7,6 +7,7 @@ from __future__ import annotations
 
 
 import json
+from datetime import datetime, timezone
 
 
 
@@ -25,6 +26,7 @@ from app.config import settings
 from app.database import get_db
 
 from app.models import Order, User
+from app.payments.paypal_adapter import PayPalAdapter
 
 from app.payments.service import apply_checkout_to_order, start_checkout
 
@@ -220,6 +222,66 @@ def paypal_return(orderId: int, db: Session = Depends(get_db)):
 
         fulfill_paid_order(db, order)
 
+    elif order and order.status == "pendingPay" and order.psp == "paypal" and order.psp_payment_id:
+
+        try:
+
+            payload = PayPalAdapter().capture_order(order.psp_payment_id)
+
+        except RuntimeError as exc:
+
+            raise HTTPException(
+
+                status_code=502,
+
+                detail={"code": "PAYMENT_PROVIDER_ERROR", "message": str(exc), "details": {}},
+
+            ) from exc
+
+        capture = None
+
+        for unit in payload.get("purchase_units", []):
+
+            payments = unit.get("payments") or {}
+
+            captures = payments.get("captures") or []
+
+            if captures:
+
+                capture = captures[0]
+
+                break
+
+        if payload.get("status") == "COMPLETED" or (capture and capture.get("status") == "COMPLETED"):
+
+            order.payment_status = "succeeded"
+
+            order.psp_transaction_id = capture.get("id") if capture else payload.get("id")
+
+            from app.payments.fulfillment import fulfill_paid_order
+
+            fulfill_paid_order(db, order)
+
+    return {"ok": True, "orderId": orderId, "status": order.status if order else None}
+
+
+
+@router.get("/paypal/cancel")
+
+def paypal_cancel(orderId: int, db: Session = Depends(get_db)):
+
+    order = db.query(Order).filter(Order.id == orderId).first()
+
+    if order and order.status == "pendingPay" and order.psp == "paypal":
+
+        order.payment_status = "cancelled"
+
+        order.status = "cancelled"
+
+        order.updated_at = datetime.now(timezone.utc)
+
+        db.commit()
+
     return {"ok": True, "orderId": orderId, "status": order.status if order else None}
 
 
@@ -244,3 +306,22 @@ def stripe_return(orderId: int, session_id: str | None = None, db: Session = Dep
 
     return {"ok": True, "orderId": orderId, "sessionId": session_id, "status": order.status if order else None}
 
+
+
+@router.get("/stripe/cancel")
+
+def stripe_cancel(orderId: int, db: Session = Depends(get_db)):
+
+    order = db.query(Order).filter(Order.id == orderId).first()
+
+    if order and order.status == "pendingPay" and order.psp == "stripe":
+
+        order.payment_status = "cancelled"
+
+        order.status = "cancelled"
+
+        order.updated_at = datetime.now(timezone.utc)
+
+        db.commit()
+
+    return {"ok": True, "orderId": orderId, "status": order.status if order else None}

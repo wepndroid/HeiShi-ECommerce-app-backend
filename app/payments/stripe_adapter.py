@@ -18,11 +18,14 @@ class StripeAdapter:
         amount_minor: int,
         currency: str,
         buyer_id: str,
+        payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
     ) -> CheckoutResult:
         secret = settings.stripe_secret_key.strip()
         if not secret:
+            if not settings.payments_simulated:
+                raise RuntimeError("Stripe credentials not configured")
             payment_id = f"pi_sim_{order_id}"
             return CheckoutResult(
                 psp=self.psp,
@@ -33,7 +36,7 @@ class StripeAdapter:
 
         # Preferred native flow: charge the buyer's saved card via a PaymentIntent so the
         # app confirms in-app (incl. 3-D Secure) instead of a hosted redirect page.
-        if customer_id and payment_method_id:
+        if payment_method == "card" and customer_id and payment_method_id:
             from app import stripe_service
 
             try:
@@ -44,6 +47,7 @@ class StripeAdapter:
                     payment_method_id=payment_method_id,
                     description=f"HeyMarket order #{order_id}",
                     metadata={"order_id": str(order_id), "buyer_id": buyer_id},
+                    transfer_group=f"order_{order_id}",
                 )
             except Exception as exc:  # surfaced as PAYMENT_PROVIDER_ERROR by the router
                 raise RuntimeError(f"Stripe charge failed: {exc}") from exc
@@ -63,11 +67,21 @@ class StripeAdapter:
             "client_reference_id": str(order_id),
             "metadata[order_id]": str(order_id),
             "metadata[buyer_id]": buyer_id,
+            "metadata[selected_payment_method]": payment_method,
+            "payment_intent_data[transfer_group]": f"order_{order_id}",
             "line_items[0][price_data][currency]": currency.lower(),
             "line_items[0][price_data][unit_amount]": str(amount_minor),
             "line_items[0][price_data][product_data][name]": f"HeyMarket order #{order_id}",
             "line_items[0][quantity]": "1",
         }
+        if payment_method == "alipay":
+            data["payment_method_types[0]"] = "alipay"
+        elif payment_method == "wechat":
+            data["payment_method_types[0]"] = "wechat_pay"
+        else:
+            # Card checkout on Stripe-hosted Checkout also surfaces Apple Pay / Google Pay
+            # automatically when the account, browser, and device are eligible.
+            data["payment_method_types[0]"] = "card"
         with httpx.Client(timeout=30.0) as client:
             response = client.post(
                 "https://api.stripe.com/v1/checkout/sessions",

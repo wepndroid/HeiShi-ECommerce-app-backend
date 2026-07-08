@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
@@ -63,6 +64,68 @@ from app.serializers import (
 )
 
 KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+WECHAT_PAYOUT_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+
+
+def _payout_provider_ready(method_type: str) -> bool:
+    if method_type == "bank":
+        return settings.stripe_enabled
+    if method_type == "paypal":
+        return settings.paypal_payout_enabled
+    if method_type == "alipay":
+        return settings.alipay_payout_enabled
+    if method_type == "wechat":
+        return settings.wechat_payout_enabled
+    return False
+
+
+def _payout_method_label(method_type: str) -> str:
+    return {
+        "bank": "Australian bank account",
+        "paypal": "PayPal",
+        "alipay": "Alipay",
+        "wechat": "WeChat Pay",
+    }.get(method_type, method_type)
+
+
+def _normalize_payout_account_ref(method_type: str, account_ref: str) -> str:
+    value = account_ref.strip()
+    if not value:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": "Payout account is required", "details": {}},
+        )
+    if method_type == "paypal":
+        value = value.lower()
+        if not EMAIL_RE.match(value):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "VALIDATION_ERROR", "message": "Enter a valid PayPal email", "details": {}},
+            )
+        return value
+    if method_type == "alipay":
+        if len(value) < 4 or len(value) > 120:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "VALIDATION_ERROR", "message": "Enter a valid Alipay account", "details": {}},
+            )
+        return value.lower() if "@" in value else value
+    if method_type == "wechat":
+        if not WECHAT_PAYOUT_ACCOUNT_RE.match(value):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": "Enter a valid WeChat payout account or OpenID",
+                    "details": {},
+                },
+            )
+        return value
+    raise HTTPException(
+        status_code=400,
+        detail={"code": "INVALID_STATE", "message": "Unsupported payout method", "details": {}},
+    )
 
 
 def _valid_avatar_url(url: str) -> bool:
@@ -519,7 +582,18 @@ def get_public_listings(
 
 @payments_router.get("/methods", response_model=list[PaymentMethodDto])
 def list_payment_methods(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    methods = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()
+    if not settings.stripe_enabled:
+        return []
+    methods = (
+        db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .order_by(PaymentMethod.is_default.desc(), PaymentMethod.id.asc())
+        .all()
+    )
     return [payment_to_dto(m) for m in methods]
 
 
@@ -534,8 +608,7 @@ _WALLET_LABELS = {
 
 @payments_router.post("/setup-intent", response_model=SetupIntentResponse)
 def create_payment_setup_intent(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Bootstrap the mobile PaymentSheet to save a card for reuse. When Stripe is not
-    configured, returns a `simulated` response so the app can fall back to demo add."""
+    """Bootstrap the mobile PaymentSheet to save a card for reuse."""
     if not settings.stripe_enabled:
         return SetupIntentResponse(
             publishableKey="",
@@ -554,35 +627,64 @@ def create_payment_setup_intent(user: User = Depends(get_current_user), db: Sess
 
 @payments_router.post("/methods", response_model=PaymentMethodDto, status_code=201)
 def add_payment_method(body: AddPaymentMethodRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Persist a connected payment method. Real path: verify the pm_... from a confirmed
-    SetupIntent with Stripe and pull the true brand/last4/expiry. Simulated path: store a
-    stand-in from `token` so offline dev keeps working."""
+    """Persist a connected card after Stripe has verified it through SetupIntent."""
+    if body.type != "card":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PAYMENT_METHOD_UNSUPPORTED",
+                "message": "Only reusable card methods can be saved in settings",
+                "details": {},
+            },
+        )
+    if not settings.stripe_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "PAYMENT_SETUP_UNAVAILABLE",
+                "message": "Secure card saving is not configured",
+                "details": {},
+            },
+        )
+    if not body.stripePaymentMethodId:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PAYMENT_METHOD_REQUIRED",
+                "message": "A verified Stripe payment method is required",
+                "details": {},
+            },
+        )
     brand = exp_month = exp_year = stripe_pm_id = last4 = None
 
-    if settings.stripe_enabled and body.stripePaymentMethodId:
-        try:
-            pm_obj = stripe_service.retrieve_payment_method(body.stripePaymentMethodId)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "PAYMENT_METHOD_INVALID", "message": "Could not verify the payment method with Stripe", "details": {}},
-            )
-        stripe_pm_id = pm_obj.get("id")
-        card = pm_obj.get("card") or {}
-        brand, last4 = card.get("brand"), card.get("last4")
-        exp_month, exp_year = card.get("exp_month"), card.get("exp_year")
-        if not user.stripe_customer_id:
-            user.stripe_customer_id = stripe_service.ensure_customer(user)
-    else:
-        token = body.token or ""
-        last4 = token[-4:] if len(token) >= 4 else "0000"
+    try:
+        pm_obj = stripe_service.retrieve_payment_method(body.stripePaymentMethodId)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PAYMENT_METHOD_INVALID", "message": "Could not verify the payment method with Stripe", "details": {}},
+        )
+    stripe_pm_id = pm_obj.get("id")
+    card = pm_obj.get("card") or {}
+    brand, last4 = card.get("brand"), card.get("last4")
+    exp_month, exp_year = card.get("exp_month"), card.get("exp_year")
+    if not user.stripe_customer_id:
+        user.stripe_customer_id = stripe_service.ensure_customer(user)
 
     if body.type == "card":
         label = f"{brand.title()} •••• {last4}" if brand and last4 else (f"Card •••• {last4}" if last4 else "Card")
     else:
         label = _WALLET_LABELS.get(body.type, body.type)
 
-    count = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).count()
+    count = (
+        db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .count()
+    )
     pm = PaymentMethod(
         user_id=user.id,
         type=body.type,
@@ -605,7 +707,7 @@ def sync_payment_methods(user: User = Depends(get_current_user), db: Session = D
     """Reconcile saved cards with Stripe after a PaymentSheet SetupIntent completes
     (PaymentSheet doesn't return the pm id to the app). No-op without Stripe."""
     if not settings.stripe_enabled or not user.stripe_customer_id:
-        return [payment_to_dto(m) for m in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()]
+        return []
     try:
         stripe_pms = stripe_service.list_card_payment_methods(user.stripe_customer_id)
     except Exception:
@@ -616,7 +718,16 @@ def sync_payment_methods(user: User = Depends(get_current_user), db: Session = D
             PaymentMethod.user_id == user.id, PaymentMethod.stripe_payment_method_id.isnot(None)
         ).all()
     }
-    has_any = db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).count() > 0
+    has_any = (
+        db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .count()
+        > 0
+    )
     for spm in stripe_pms:
         pmid = spm.get("id")
         card = spm.get("card") or {}
@@ -641,7 +752,17 @@ def sync_payment_methods(user: User = Depends(get_current_user), db: Session = D
             )
             has_any = True
     db.commit()
-    return [payment_to_dto(m) for m in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all()]
+    return [
+        payment_to_dto(m)
+        for m in db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .order_by(PaymentMethod.is_default.desc(), PaymentMethod.id.asc())
+        .all()
+    ]
 
 
 @payments_router.delete("/methods/{method_id}", status_code=204)
@@ -650,7 +771,16 @@ def remove_payment_method(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    pm = db.query(PaymentMethod).filter(PaymentMethod.id == method_id, PaymentMethod.user_id == user.id).first()
+    pm = (
+        db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.id == method_id,
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .first()
+    )
     if not pm:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payment method not found", "details": {}})
     if settings.stripe_enabled and getattr(pm, "stripe_payment_method_id", None):
@@ -660,7 +790,14 @@ def remove_payment_method(
     db.commit()
     if was_default:
         remaining = (
-            db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).order_by(PaymentMethod.id.asc()).first()
+            db.query(PaymentMethod)
+            .filter(
+                PaymentMethod.user_id == user.id,
+                PaymentMethod.type == "card",
+                PaymentMethod.stripe_payment_method_id.isnot(None),
+            )
+            .order_by(PaymentMethod.id.asc())
+            .first()
         )
         if remaining:
             remaining.is_default = True
@@ -675,11 +812,28 @@ def set_default_payment_method(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    pm = db.query(PaymentMethod).filter(PaymentMethod.id == method_id, PaymentMethod.user_id == user.id).first()
+    pm = (
+        db.query(PaymentMethod)
+        .filter(
+            PaymentMethod.id == method_id,
+            PaymentMethod.user_id == user.id,
+            PaymentMethod.type == "card",
+            PaymentMethod.stripe_payment_method_id.isnot(None),
+        )
+        .first()
+    )
     if not pm:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Payment method not found", "details": {}})
     if body.isDefault:
-        for method in db.query(PaymentMethod).filter(PaymentMethod.user_id == user.id).all():
+        for method in (
+            db.query(PaymentMethod)
+            .filter(
+                PaymentMethod.user_id == user.id,
+                PaymentMethod.type == "card",
+                PaymentMethod.stripe_payment_method_id.isnot(None),
+            )
+            .all()
+        ):
             method.is_default = method.id == method_id
     else:
         pm.is_default = False
@@ -690,12 +844,76 @@ def set_default_payment_method(
 
 @payouts_router.get("/methods", response_model=list[PayoutMethodDto])
 def list_payout_methods(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    methods = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).all()
+    methods = (
+        db.query(PayoutMethod)
+        .filter(PayoutMethod.user_id == user.id)
+        .order_by(PayoutMethod.is_default.desc(), PayoutMethod.type.asc(), PayoutMethod.id.asc())
+        .all()
+    )
     return [payout_to_dto(m) for m in methods]
 
 
 @payouts_router.post("/methods", response_model=PayoutMethodDto, status_code=201)
 def add_payout_method(body: AddPayoutMethodRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if body.type == "bank":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "USE_CONNECT_ONBOARDING",
+                "message": "Bank payouts must be connected through Stripe onboarding",
+                "details": {},
+            },
+        )
+    if body.type == "alipay" and not user.alipay_bound:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PAYOUT_BIND_REQUIRED",
+                "message": "Link Alipay in Account Safety before adding an Alipay payout destination",
+                "details": {"type": "alipay", "screen": "accountSafety"},
+            },
+        )
+    if body.type == "wechat" and not user.wechat_bound:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PAYOUT_BIND_REQUIRED",
+                "message": "Link WeChat in Account Safety before adding a WeChat payout destination",
+                "details": {"type": "wechat", "screen": "accountSafety"},
+            },
+        )
+    if not _payout_provider_ready(body.type):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PAYOUT_PROVIDER_NOT_READY",
+                "message": f"{_payout_method_label(body.type)} payouts are not configured on the platform",
+                "details": {},
+            },
+        )
+    account_ref = _normalize_payout_account_ref(body.type, body.accountRef or body.accountToken or "")
+    count = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).count()
+    pm = (
+        db.query(PayoutMethod)
+        .filter(PayoutMethod.user_id == user.id, PayoutMethod.type == body.type)
+        .first()
+    )
+    if not pm:
+        pm = PayoutMethod(
+            user_id=user.id,
+            type=body.type,
+            label=_payout_method_label(body.type),
+            is_default=count == 0,
+        )
+        db.add(pm)
+    pm.label = _payout_method_label(body.type)
+    pm.account_ref = account_ref
+    pm.last4 = None
+    pm.payouts_enabled = True
+    db.commit()
+    db.refresh(pm)
+    return payout_to_dto(pm)
+
     last4 = body.accountToken[-4:] if len(body.accountToken) >= 4 else "0000"
     labels = {
         "bank": f"Bank •••• {last4}",
@@ -764,10 +982,16 @@ def set_default_payout_method(
 
 @payouts_router.post("/connect/link", response_model=ConnectOnboardingResponse)
 def create_payout_onboarding_link(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Create/return a Stripe Connect Express onboarding URL for bank payouts. When Stripe
-    is not configured, returns `simulated` so the app can fall back to the demo add flow."""
+    """Create/return a Stripe Connect Express onboarding URL for bank payouts."""
     if not settings.stripe_enabled:
-        return ConnectOnboardingResponse(url="", simulated=True)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PAYOUT_PROVIDER_NOT_READY",
+                "message": "Stripe bank payouts are not configured on the platform",
+                "details": {},
+            },
+        )
     account_id = stripe_service.ensure_connect_account(user)
     if user.stripe_connect_id != account_id:
         user.stripe_connect_id = account_id
@@ -795,14 +1019,23 @@ def get_payout_connect_status(user: User = Depends(get_current_user), db: Sessio
         )
         if not bank:
             count = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).count()
-            bank = PayoutMethod(user_id=user.id, type="bank", label="Bank (Stripe)", is_default=count == 0)
+            bank = PayoutMethod(
+                user_id=user.id,
+                type="bank",
+                label="Australian bank account",
+                is_default=count == 0,
+            )
             db.add(bank)
         bank.stripe_external_account_id = user.stripe_connect_id
         bank.payouts_enabled = payouts_enabled
+        bank.account_ref = None
         if last4:
             bank.last4 = last4
             bank.label = f"Bank •••• {last4}"
         db.commit()
+        if bank.label != "Australian bank account":
+            bank.label = "Australian bank account"
+            db.commit()
     return ConnectStatusResponse(connected=True, detailsSubmitted=details, payoutsEnabled=payouts_enabled)
 
 

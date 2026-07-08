@@ -25,6 +25,7 @@ from app.image_search import hamming_distance, hash_image_bytes, hash_image_url,
 from app.media_urls import normalize_media_url, normalize_media_urls
 from app.models import Favorite, Listing, Order, Review, SearchLog, User, ViewHistory
 from app.pagination import paginate
+from app.platform_config import escrow_fee_from_db
 from app.schemas import (
     ImageSearchResponseDto,
     ListingDetailDto,
@@ -306,7 +307,7 @@ def get_listing(
     if user and listing.seller_id != user.id and users_blocked(db, user.id, listing.seller_id):
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
     expire_stale_pending_pay_orders(db, settings.pending_pay_expire_minutes)
-    detail = listing_to_detail(listing, lang)
+    detail = listing_to_detail(listing, lang, escrow_fee=escrow_fee_from_db(db))
     purchase_available = compute_purchase_available(db, listing)
     return detail.model_copy(update={"purchaseAvailable": purchase_available})
 

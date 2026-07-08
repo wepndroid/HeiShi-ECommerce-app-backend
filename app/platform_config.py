@@ -7,9 +7,28 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.form_options import LISTING_FORM_OPTIONS, _opt
-from app.models import PlatformBanner, PlatformCategory, PlatformRegion
+from app.models import PlatformBanner, PlatformCategory, PlatformRegion, PlatformSetting
 from app.routers.region_safety import REGION_DATA
 from app.schemas import FormOptionDto, ListingFormOptionsDto, RegionCityDto, RegionDto
+
+DEFAULT_ESCROW_FEE = 0.0
+ESCROW_FEE_SETTING_KEY = "payments.escrowFee"
+
+
+def setting_value_from_db(db: Session, key: str, default: str) -> str:
+    row = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    if not row or row.value is None:
+        return default
+    return row.value
+
+
+def escrow_fee_from_db(db: Session) -> float:
+    raw = setting_value_from_db(db, ESCROW_FEE_SETTING_KEY, str(DEFAULT_ESCROW_FEE)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ESCROW_FEE
+    return round(max(value, 0.0), 2)
 
 
 def form_options_from_db(db: Session) -> ListingFormOptionsDto:

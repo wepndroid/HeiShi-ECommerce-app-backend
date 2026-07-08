@@ -36,11 +36,12 @@ class PayPalAdapter:
         amount_minor: int,
         currency: str,
         buyer_id: str,
+        payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
     ) -> CheckoutResult:
         # customer_id / payment_method_id are Stripe-only; PayPal ignores them.
-        if not settings.paypal_client_id.strip():
+        if settings.payments_simulated and not settings.paypal_client_id.strip():
             token = f"sim_{order_id}"
             return CheckoutResult(
                 psp=self.psp,
@@ -81,3 +82,41 @@ class PayPalAdapter:
             checkout_url=approve,
             psp_payment_id=payload.get("id"),
         )
+
+    def capture_order(self, paypal_order_id: str) -> dict:
+        token = self._access_token()
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                f"{self._base_url()}/v2/checkout/orders/{paypal_order_id}/capture",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"PayPal capture failed: {response.text[:200]}")
+        return response.json()
+
+    def refund_capture(
+        self,
+        capture_id: str,
+        *,
+        amount_minor: int | None = None,
+        currency: str = "AUD",
+        note: str | None = None,
+    ) -> dict:
+        token = self._access_token()
+        body: dict = {}
+        if amount_minor is not None:
+            body["amount"] = {
+                "currency_code": currency.upper(),
+                "value": f"{amount_minor / 100:.2f}",
+            }
+        if note:
+            body["note_to_payer"] = note
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                f"{self._base_url()}/v2/payments/captures/{capture_id}/refund",
+                json=body or None,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"PayPal refund failed: {response.text[:200]}")
+        return response.json()

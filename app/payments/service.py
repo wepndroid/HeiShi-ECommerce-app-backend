@@ -50,6 +50,7 @@ def start_checkout(order: Order, *, payment_method: str, db: Session | None = No
         amount_minor=amount_to_minor(total),
         currency=currency,
         buyer_id=order.buyer_id,
+        payment_method=payment_method,
         customer_id=customer_id,
         payment_method_id=payment_method_id,
     )

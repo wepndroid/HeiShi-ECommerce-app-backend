@@ -11,9 +11,9 @@ from app.catalog_helpers import (
     apply_bundle_payment,
     listing_checkout_amount,
 )
-from app.config import settings
 from app.models import Listing, Order, User
 from app.order_jobs import schedule_auto_confirm
+from app.platform_config import escrow_fee_from_db
 from app.push_notifications import send_order_paid_push
 
 
@@ -47,7 +47,7 @@ def fulfill_paid_order(db: Session, order: Order) -> Order:
             expected = listing_checkout_amount(listing)
         if expected > 0:
             order.amount = order.amount or expected
-        order.escrow_fee = settings.escrow_fee if listing.escrow_supported else 0.0
+        order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
         if listing.status == "active":
             if order.bundle_item_id:
                 apply_bundle_item_payment(listing, order.bundle_item_id)
