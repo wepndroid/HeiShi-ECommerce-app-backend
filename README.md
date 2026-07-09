@@ -33,8 +33,19 @@ minimum for a real deployment, set `JWT_SECRET`, `BASE_URL`, `CORS_ORIGINS`,
 `EXPOSE_DEV_OTP=false`, and the auth/payment provider credentials you intend to
 enable.
 
-For uploaded photos, attach a Railway Volume if files must survive redeploys and set
-`UPLOAD_DIR` to that mounted path, for example `/data/uploads`.
+For uploaded photos in production, use Supabase Storage:
+
+```env
+STORAGE_BACKEND=supabase
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...
+SUPABASE_STORAGE_BUCKET=listing-images
+SUPABASE_STORAGE_PATH_PREFIX=uploads
+```
+
+Create `listing-images` as a public Supabase Storage bucket so the API can return
+stable public image URLs to the mobile app. `UPLOAD_DIR` is only used when
+`STORAGE_BACKEND=local`.
 
 ## Frontend connection
 
@@ -100,7 +111,8 @@ app/
 
 **Database:** SQLite by default (`heishi.db`). Set `DATABASE_URL` for PostgreSQL in production.
 
-**Uploads:** Stored in `uploads/` and served at `/uploads/{key}`.
+**Uploads:** Supabase Storage in production, or local `uploads/` when
+`STORAGE_BACKEND=local`.
 
 ## Endpoint coverage
 

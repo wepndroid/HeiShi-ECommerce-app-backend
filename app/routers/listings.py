@@ -16,6 +16,7 @@ from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
 from app.schemas import CreateListingRequest, ListingDetailDto, ListingSummaryDto, Paginated, UploadImageResponse, BundleItemRequest
 from app.serializers import listing_to_detail, listing_to_summary
+from app.storage import upload_image_bytes
 
 
 def _build_bundle_meta(body: CreateListingRequest) -> dict:
@@ -699,11 +700,5 @@ async def upload_image(
     if not resolved_type:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "Invalid file type", "details": {}})
     ext = _ext_for_upload_type(resolved_type, file.filename)
-    key = f"{uuid.uuid4().hex}{ext}"
-    upload_path = Path(settings.upload_dir)
-    upload_path.mkdir(parents=True, exist_ok=True)
-    dest = upload_path / key
-    with open(dest, "wb") as f:
-        f.write(content)
-    url = f"{settings.base_url}/uploads/{key}"
+    url, key = upload_image_bytes(content, resolved_type, ext, user_id=user.id)
     return UploadImageResponse(url=url, key=key)

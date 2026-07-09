@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     base_url: str = "http://127.0.0.1:8000"
     cors_origins: str = "*"
     upload_dir: str = "uploads"
+    storage_backend: str = "local"
+    supabase_storage_bucket: str = ""
+    supabase_storage_path_prefix: str = "uploads"
     escrow_fee: float = 0.0
     aud_to_cny_display_rate: float = 4.75
     pending_pay_expire_minutes: int = 30
