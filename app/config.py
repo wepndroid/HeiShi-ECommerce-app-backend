@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     escrow_fee: float = 0.0
     aud_to_cny_display_rate: float = 4.75
     pending_pay_expire_minutes: int = 30
+    chat_messages: bool = True
+    remind_pay: bool = True
+    remind_ship: bool = True
+    show_wechat_badge: bool = False
     admin_seed_phone: str = "0499999001"
     admin_seed_password: str = "Admin123!"
     # Legacy phone-OTP dev mode: when true, register/login send-code responses include the

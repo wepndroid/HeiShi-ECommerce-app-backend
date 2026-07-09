@@ -17,6 +17,25 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 API base: `http://localhost:8000/v1`  
 Interactive docs: `http://localhost:8000/docs`
 
+## Railway deployment
+
+Deploy the `Backend/` service with the included `railway.toml`. It pins the
+Railway builder and start command:
+
+```text
+python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Railway provides `PORT` automatically. Deploy this backend Git repository
+directly as a single FastAPI service. Attach a Postgres service and set
+`DATABASE_URL`, then copy the required production values from `.env.example`. At
+minimum for a real deployment, set `JWT_SECRET`, `BASE_URL`, `CORS_ORIGINS`,
+`EXPOSE_DEV_OTP=false`, and the auth/payment provider credentials you intend to
+enable.
+
+For uploaded photos, attach a Railway Volume if files must survive redeploys and set
+`UPLOAD_DIR` to that mounted path, for example `/data/uploads`.
+
 ## Frontend connection
 
 In `Frontend/.env`:
