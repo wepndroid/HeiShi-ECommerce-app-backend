@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.db
 .env
+production.env
 uploads/*
 !uploads/.gitkeep
 heishi.db
