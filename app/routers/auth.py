@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import secrets
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
@@ -46,6 +47,7 @@ from app.schemas import (
     SendRegisterCodeResponse,
     SyncProfileRequest,
     OAuthProvisionRequest,
+    WeChatAuthRequest,
     ChangePasswordRequest,
 )
 from app.serializers import user_to_dto
@@ -62,6 +64,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 supabase_security = HTTPBearer(auto_error=False)
 
 KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
+WECHAT_ACCESS_TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token"
+WECHAT_USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo"
 
 
 def _valid_avatar_url(url: str) -> bool:
@@ -69,6 +73,106 @@ def _valid_avatar_url(url: str) -> bool:
     if not trimmed or trimmed.startswith(("file://", "content://")):
         return False
     return trimmed.startswith(("http://", "https://", "/uploads/"))
+
+
+def _wechat_not_configured() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "WECHAT_NOT_CONFIGURED",
+            "message": "WeChat login is not configured",
+            "details": {},
+        },
+    )
+
+
+def _wechat_error(message: str, *, status_code: int = 400, code: str = "WECHAT_AUTH_FAILED") -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message, "details": {}},
+    )
+
+
+def _wechat_exchange_code(code: str) -> dict:
+    app_id = settings.wechat_open_app_id.strip()
+    app_secret = settings.wechat_open_app_secret.strip()
+    if not app_id or not app_secret:
+        raise _wechat_not_configured()
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            token_response = client.get(
+                WECHAT_ACCESS_TOKEN_URL,
+                params={
+                    "appid": app_id,
+                    "secret": app_secret,
+                    "code": code.strip(),
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_payload = token_response.json()
+    except Exception as exc:
+        raise _wechat_error(
+            "Could not reach WeChat login service",
+            status_code=502,
+            code="WECHAT_NETWORK_ERROR",
+        ) from exc
+
+    if token_payload.get("errcode"):
+        raise _wechat_error(str(token_payload.get("errmsg") or "WeChat authorization failed"))
+
+    access_token = token_payload.get("access_token")
+    openid = token_payload.get("openid")
+    if not access_token or not openid:
+        raise _wechat_error("WeChat authorization response is missing openid or access token")
+
+    profile: dict = {}
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            profile_response = client.get(
+                WECHAT_USERINFO_URL,
+                params={
+                    "access_token": access_token,
+                    "openid": openid,
+                    "lang": "en",
+                },
+            )
+            profile = profile_response.json()
+    except Exception:
+        profile = {}
+
+    if profile.get("errcode"):
+        profile = {}
+
+    unionid = profile.get("unionid") or token_payload.get("unionid")
+    return {
+        "openid": openid,
+        "unionid": unionid,
+        "nickname": profile.get("nickname"),
+        "avatar_url": profile.get("headimgurl"),
+    }
+
+
+def _find_wechat_user(db: Session, openid: str, unionid: str | None) -> User | None:
+    if unionid:
+        user = db.query(User).filter(User.wechat_unionid == unionid).first()
+        if user:
+            return user
+    return db.query(User).filter(User.wechat_openid == openid).first()
+
+
+def _valid_optional_city(raw_city: str | None) -> str | None:
+    if raw_city is None:
+        return None
+    city = raw_city.strip()
+    if not city:
+        return None
+    if city not in KNOWN_CITY_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": "Invalid city", "details": {}},
+        )
+    return city
 
 
 def _require_supabase_claims(
@@ -218,6 +322,63 @@ def oauth_provision(
     db.commit()
     db.refresh(user)
     return user_to_dto(user)
+
+
+@router.post("/wechat", response_model=AuthTokensDto)
+def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
+    """Sign in or register via native WeChat Open Platform authorization code.
+
+    The mobile app obtains a one-time WeChat ``code`` from the native SDK. The
+    backend exchanges that code with WeChat, stores openid/unionid, and issues
+    the same HeyMarket JWT session used by phone registration/login.
+    """
+
+    profile = _wechat_exchange_code(body.code)
+    openid = profile["openid"]
+    unionid = profile.get("unionid")
+    user = _find_wechat_user(db, openid, unionid)
+    avatar_url = profile.get("avatar_url")
+    if avatar_url and not _valid_avatar_url(avatar_url):
+        avatar_url = None
+
+    if user is not None:
+        user.wechat_openid = openid
+        if unionid:
+            user.wechat_unionid = unionid
+        user.wechat_bound = True
+        if avatar_url and not user.avatar_url:
+            user.avatar_url = avatar_url
+        db.commit()
+        db.refresh(user)
+        return _issue_tokens(db, user)
+
+    nickname = (
+        (body.nickname.strip() if body.nickname else None)
+        or profile.get("nickname")
+        or "WeChat user"
+    )
+    city = _valid_optional_city(body.city)
+    heishi_seed = unionid or openid
+    user = User(
+        nickname=nickname[:50],
+        phone=None,
+        email=None,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        heishi_id=generate_heishi_id(db, heishi_seed),
+        city=city,
+        avatar_url=avatar_url,
+        phone_verified=False,
+        wechat_bound=True,
+        wechat_openid=openid,
+        wechat_unionid=unionid,
+    )
+    db.add(user)
+    db.flush()
+    get_or_create_settings(db, user.id)
+    issue_welcome_coupon(db, user.id, user.language)
+    db.commit()
+    db.refresh(user)
+    return _issue_tokens(db, user)
 
 
 def _validation_error(message: str = "Invalid phone format") -> HTTPException:

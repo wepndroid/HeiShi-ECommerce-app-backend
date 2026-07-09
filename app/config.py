@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     alipay_app_id: str = ""
     alipay_private_key: str = ""
     alipay_public_key: str = ""
+    # WeChat Open Platform login (not WeChat Pay). The mobile app obtains an
+    # authorization code, then the backend exchanges it for openid/unionid.
+    wechat_open_app_id: str = ""
+    wechat_open_app_secret: str = ""
     wechat_pay_app_id: str = ""
     wechat_pay_mch_id: str = ""
     wechat_pay_api_v3_key: str = ""

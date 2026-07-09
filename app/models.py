@@ -52,6 +52,8 @@ class User(Base):
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     wechat_bound: Mapped[bool] = mapped_column(Boolean, default=False)
+    wechat_openid: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    wechat_unionid: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     alipay_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     identity_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     business_verified: Mapped[bool] = mapped_column(Boolean, default=False)

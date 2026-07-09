@@ -275,6 +275,8 @@ def _sqlite_migrate_mvp_admin(engine: Engine) -> None:
         ("banned_at", "banned_at DATETIME"),
         ("ban_reason", "ban_reason TEXT"),
         ("stripe_connect_id", "stripe_connect_id VARCHAR(100)"),
+        ("wechat_openid", "wechat_openid VARCHAR(100)"),
+        ("wechat_unionid", "wechat_unionid VARCHAR(100)"),
         ("preferred_display_currency", "preferred_display_currency VARCHAR(3) DEFAULT 'aud'"),
     )
     for col, ddl in user_cols:

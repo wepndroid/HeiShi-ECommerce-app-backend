@@ -45,6 +45,33 @@ from app.schemas import AuthTokensDto, AuthUserDto
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+ADMIN_VISIBLE_NICKNAMES = {"lukas", "ldplayer_user"}
+
+
+def _visible_admin_nickname(nickname: str | None) -> str | None:
+    if not nickname:
+        return None
+    normalized = nickname.strip().lower()
+    return normalized if normalized in ADMIN_VISIBLE_NICKNAMES else None
+
+
+def _is_visible_admin_user(user: User | None) -> bool:
+    if not user or bool(getattr(user, "is_admin", False)):
+        return False
+    return _visible_admin_nickname(user.nickname) is not None
+
+
+def _visible_admin_users(rows: list[User]) -> list[User]:
+    visible: list[User] = []
+    seen: set[str] = set()
+    for user in rows:
+        key = _visible_admin_nickname(user.nickname)
+        if not key or key in seen or bool(getattr(user, "is_admin", False)):
+            continue
+        visible.append(user)
+        seen.add(key)
+    return visible
+
 
 class AdminLoginRequest(BaseModel):
     phone: str
@@ -469,9 +496,9 @@ def list_users(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    q = db.query(User).order_by(User.created_at.desc())
-    total = q.count()
-    rows = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    rows = _visible_admin_users(db.query(User).order_by(User.created_at.desc()).all())
+    total = len(rows)
+    page_rows = rows[(page - 1) * pageSize : (page - 1) * pageSize + pageSize]
     return {
         "items": [
             {
@@ -484,7 +511,7 @@ def list_users(
                 "accountStatus": u.account_status,
                 "createdAt": u.created_at.isoformat() if u.created_at else None,
             }
-            for u in rows
+            for u in page_rows
         ],
         "total": total,
         "page": page,
@@ -872,6 +899,16 @@ def list_verifications(db: Session = Depends(get_db), admin: User = Depends(requ
         .limit(100)
         .all()
     )
+    visible_rows: list[VerificationSubmission] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not _is_visible_admin_user(row.user):
+            continue
+        key = _visible_admin_nickname(row.user.nickname)
+        if not key or key in seen:
+            continue
+        visible_rows.append(row)
+        seen.add(key)
     return {
         "items": [
             {
@@ -884,7 +921,7 @@ def list_verifications(db: Session = Depends(get_db), admin: User = Depends(requ
                 "legalName": row.legal_name,
                 "createdAt": row.created_at.isoformat() if row.created_at else None,
             }
-            for row in rows
+            for row in visible_rows
         ]
     }
 
@@ -1849,9 +1886,9 @@ def list_auth_status(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    q = db.query(User).order_by(User.created_at.desc())
-    total = q.count()
-    rows = q.offset((page - 1) * pageSize).limit(pageSize).all()
+    rows = _visible_admin_users(db.query(User).order_by(User.created_at.desc()).all())
+    total = len(rows)
+    page_rows = rows[(page - 1) * pageSize : (page - 1) * pageSize + pageSize]
     return {
         "items": [
             {
@@ -1865,7 +1902,7 @@ def list_auth_status(
                 "identityVerified": bool(u.identity_verified),
                 "businessVerified": bool(u.business_verified),
             }
-            for u in rows
+            for u in page_rows
         ],
         "total": total,
         "page": page,

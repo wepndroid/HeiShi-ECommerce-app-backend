@@ -88,6 +88,14 @@ class OAuthProvisionRequest(BaseModel):
     city: str | None = None
 
 
+class WeChatAuthRequest(BaseModel):
+    """Native WeChat login callback payload from the mobile app."""
+
+    code: str = Field(min_length=1, max_length=512)
+    nickname: str | None = Field(default=None, min_length=1, max_length=50)
+    city: str | None = Field(default=None, min_length=1, max_length=100)
+
+
 # Catalog
 class SellerDto(BaseModel):
     id: str
