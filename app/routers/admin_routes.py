@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from queue import Empty
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.admin_audit import log_admin_action
+from app.admin_notifications import (
+    notification_payload,
+    subscribe_admin_notifications,
+    unsubscribe_admin_notifications,
+)
 from app.admin_auth import require_admin
 from app.auth import create_access_token, create_refresh_token, hash_password, normalize_phone, store_refresh_token, verify_password
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models import (
+    AdminNotification,
     BlockedKeyword,
     Conversation,
     DailyActiveUser,
@@ -45,32 +55,98 @@ from app.schemas import AuthTokensDto, AuthUserDto
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-ADMIN_VISIBLE_NICKNAMES = {"lukas", "ldplayer_user"}
 
+def _admin_notification_dto(row: AdminNotification) -> dict:
+    return notification_payload(row)
+
+
+@router.get("/notifications")
+def list_admin_notifications(
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    rows = db.query(AdminNotification).order_by(AdminNotification.created_at.desc()).limit(limit).all()
+    unread_count = db.query(func.count(AdminNotification.id)).filter(AdminNotification.is_read.is_(False)).scalar() or 0
+    return {"items": [_admin_notification_dto(row) for row in rows], "unreadCount": unread_count}
+
+
+@router.post("/notifications/{notification_id}/read", status_code=204)
+def mark_admin_notification_read(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    row = db.query(AdminNotification).filter(AdminNotification.id == notification_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Notification not found", "details": {}})
+    row.is_read = True
+    db.commit()
+
+
+@router.post("/notifications/read-all", status_code=204)
+def mark_all_admin_notifications_read(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    db.query(AdminNotification).filter(AdminNotification.is_read.is_(False)).update({"is_read": True})
+    db.commit()
+
+
+@router.get("/notifications/stream")
+async def stream_admin_notifications(request: Request, admin: User = Depends(require_admin)):
+    async def events():
+        subscriber = subscribe_admin_notifications()
+        seen_ids: set[str] = set()
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(AdminNotification)
+                .filter(AdminNotification.is_read.is_(False))
+                .order_by(AdminNotification.created_at.asc())
+                .all()
+            )
+            for row in rows:
+                seen_ids.add(row.id)
+                yield f"data: {json.dumps(_admin_notification_dto(row))}\n\n"
+        finally:
+            db.close()
+
+        idle_ticks = 0
+        try:
+            while not await request.is_disconnected():
+                try:
+                    payload = await asyncio.to_thread(subscriber.get, True, 1.0)
+                except Empty:
+                    payload = None
+                if payload and payload["id"] not in seen_ids:
+                    seen_ids.add(payload["id"])
+                    yield f"data: {json.dumps(payload)}\n\n"
+                idle_ticks += 1
+                if idle_ticks >= 15:
+                    idle_ticks = 0
+                    yield ": keep-alive\n\n"
+        finally:
+            unsubscribe_admin_notifications(subscriber)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 def _visible_admin_nickname(nickname: str | None) -> str | None:
     if not nickname:
         return None
-    normalized = nickname.strip().lower()
-    return normalized if normalized in ADMIN_VISIBLE_NICKNAMES else None
+    return nickname.strip().lower()
 
 
 def _is_visible_admin_user(user: User | None) -> bool:
-    if not user or bool(getattr(user, "is_admin", False)):
-        return False
-    return _visible_admin_nickname(user.nickname) is not None
+    return user is not None
 
 
 def _visible_admin_users(rows: list[User]) -> list[User]:
-    visible: list[User] = []
-    seen: set[str] = set()
-    for user in rows:
-        key = _visible_admin_nickname(user.nickname)
-        if not key or key in seen or bool(getattr(user, "is_admin", False)):
-            continue
-        visible.append(user)
-        seen.add(key)
-    return visible
+    return [user for user in rows if _is_visible_admin_user(user)]
 
 
 class AdminLoginRequest(BaseModel):
@@ -1412,7 +1488,7 @@ def resolve_dispute(
                     "details": {},
                 },
             )
-        order.status = "cancelled"
+        order.status = "refunded"
         order.payout_paused = False
     elif body.resolution == "complete":
         order.status = "completed"

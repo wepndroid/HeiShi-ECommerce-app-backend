@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
+from app.admin_notifications import notify_admin
 from app.database import get_db
 from app.models import BlocklistEntry, SafetyReport, User
 from app.pagination import paginate
@@ -155,16 +156,32 @@ def list_reports(
 
 @router.post("/safety/reports", status_code=204)
 def submit_report(body: SubmitReportRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    details = (body.details or "").strip()
+    if body.targetType == "user" and not details:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "VALIDATION_ERROR", "message": "Report description is required", "details": {}},
+        )
     report = SafetyReport(
         reporter_id=user.id,
         target_type=body.targetType,
         target_id=body.targetId,
         reason=body.reason,
-        details=body.details,
+        details=details or None,
     )
     if body.evidenceUrls:
         report.evidence_urls = body.evidenceUrls[:10]
     db.add(report)
+    db.flush()
+    notify_admin(
+        db,
+        event_type="report_submitted",
+        title="New user report",
+        body=f"{user.nickname} submitted a {body.targetType} report.",
+        target_type="report",
+        target_id=report.id,
+        action_path=f"/reports/{report.id}",
+    )
     db.commit()
     return Response(status_code=204)
 

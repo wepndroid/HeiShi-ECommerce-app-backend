@@ -12,7 +12,7 @@ class PayPalAdapter:
     psp = "paypal"
 
     def _base_url(self) -> str:
-        return "https://api-m.sandbox.paypal.com" if settings.payments_simulated else "https://api-m.paypal.com"
+        return "https://api-m.sandbox.paypal.com" if settings.paypal_sandbox else "https://api-m.paypal.com"
 
     def _access_token(self) -> str:
         client_id = settings.paypal_client_id.strip()
@@ -39,6 +39,7 @@ class PayPalAdapter:
         payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
+        native_payment_sheet: bool = False,
     ) -> CheckoutResult:
         # customer_id / payment_method_id are Stripe-only; PayPal ignores them.
         if settings.payments_simulated and not settings.paypal_client_id.strip():

@@ -51,6 +51,7 @@ class User(Base):
     heishi_id: Mapped[str] = mapped_column(String(20), unique=True)
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    google_sub: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     wechat_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     wechat_openid: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     wechat_unionid: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
@@ -492,6 +493,20 @@ class AdminAuditLog(Base):
     before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     after_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AdminNotification(Base):
+    __tablename__ = "admin_notifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    target_type: Mapped[str] = mapped_column(String(30), index=True)
+    target_id: Mapped[str] = mapped_column(String(50), index=True)
+    action_path: Mapped[str] = mapped_column(String(300))
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class BlockedKeyword(Base):

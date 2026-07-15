@@ -21,6 +21,7 @@ class StripeAdapter:
         payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
+        native_payment_sheet: bool = False,
     ) -> CheckoutResult:
         secret = settings.stripe_secret_key.strip()
         if not secret:
@@ -34,8 +35,32 @@ class StripeAdapter:
                 psp_payment_id=payment_id,
             )
 
-        # Preferred native flow: charge the buyer's saved card via a PaymentIntent so the
-        # app confirms in-app (incl. 3-D Secure) instead of a hosted redirect page.
+        if payment_method == "card" and native_payment_sheet and customer_id:
+            from app import stripe_service
+
+            try:
+                intent = stripe_service.create_payment_sheet_intent(
+                    amount_minor=amount_minor,
+                    currency=currency,
+                    customer_id=customer_id,
+                    description=f"HeyMarket order #{order_id}",
+                    metadata={"order_id": str(order_id), "buyer_id": buyer_id},
+                    transfer_group=f"order_{order_id}",
+                )
+                ephemeral_key = stripe_service.create_customer_ephemeral_key(customer_id)
+            except Exception as exc:
+                raise RuntimeError(f"Stripe PaymentSheet setup failed: {exc}") from exc
+            return CheckoutResult(
+                psp=self.psp,
+                payment_status=intent.get("status", "requires_payment_method"),
+                client_secret=intent.get("client_secret"),
+                psp_payment_id=intent.get("id"),
+                publishable_key=settings.stripe_publishable_key.strip(),
+                customer_id=customer_id,
+                ephemeral_key=ephemeral_key,
+            )
+
+        # Saved-card server confirmation remains available to non-PaymentSheet callers.
         if payment_method == "card" and customer_id and payment_method_id:
             from app import stripe_service
 

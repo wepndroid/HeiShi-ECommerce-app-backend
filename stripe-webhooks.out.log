@@ -1,0 +1,14 @@
+Forwarding Stripe test events to http://127.0.0.1:8001/v1/payments/webhooks/stripe
+Keep this window open during the escrow test.
+Checking for new versions...
+
+2026-07-14 17:17:58   --> payment_intent.succeeded [evt_1TtGWQV05PbIzr6baRBq3KFs]
+2026-07-14 17:17:58  <--  [400] POST http://127.0.0.1:8001/v1/payments/webhooks/stripe [evt_1TtGWQV05PbIzr6baRBq3KFs]
+2026-07-14 17:20:23   --> payment_intent.succeeded [evt_1TtGYkV05PbIzr6b3hcgSpWi]
+2026-07-14 17:20:23  <--  [400] POST http://127.0.0.1:8001/v1/payments/webhooks/stripe [evt_1TtGYkV05PbIzr6b3hcgSpWi]
+2026-07-14 17:21:11   --> payment_intent.succeeded [evt_1TtGZXV05PbIzr6bISKLRPzj]
+2026-07-14 17:21:11  <--  [400] POST http://127.0.0.1:8001/v1/payments/webhooks/stripe [evt_1TtGZXV05PbIzr6bISKLRPzj]
+2026-07-14 17:22:59   --> payment_intent.succeeded [evt_1TtGbHV05PbIzr6bgAKJzN3h]
+2026-07-14 17:22:59  <--  [200] POST http://127.0.0.1:8001/v1/payments/webhooks/stripe [evt_1TtGbHV05PbIzr6bgAKJzN3h]
+2026-07-14 19:58:53   --> payment_intent.succeeded [evt_1TtJ28V05PbIzr6bm94Yf0aH]
+2026-07-14 19:58:53  <--  [200] POST http://127.0.0.1:8001/v1/payments/webhooks/stripe [evt_1TtJ28V05PbIzr6bm94Yf0aH]

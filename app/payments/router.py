@@ -46,6 +46,8 @@ class CheckoutRequest(BaseModel):
 
     paymentMethod: str = Field(default="card", pattern="^(card|apple|google|alipay|wechat|paypal)$")
 
+    nativePaymentSheet: bool = False
+
 
 
 
@@ -61,6 +63,12 @@ class CheckoutResponse(BaseModel):
     checkoutUrl: str | None = None
 
     simulated: bool = False
+
+    publishableKey: str | None = None
+
+    customerId: str | None = None
+
+    ephemeralKey: str | None = None
 
 
 
@@ -102,7 +110,17 @@ def create_checkout(
 
     try:
 
-        result = start_checkout(order, payment_method=body.paymentMethod, db=db)
+        result = start_checkout(
+
+            order,
+
+            payment_method=body.paymentMethod,
+
+            db=db,
+
+            native_payment_sheet=body.nativePaymentSheet,
+
+        )
 
     except RuntimeError as exc:
 
@@ -129,6 +147,12 @@ def create_checkout(
         checkoutUrl=result.checkout_url,
 
         simulated=settings.payments_simulated,
+
+        publishableKey=result.publishable_key,
+
+        customerId=result.customer_id,
+
+        ephemeralKey=result.ephemeral_key,
 
     )
 
@@ -303,6 +327,21 @@ def stripe_return(orderId: int, session_id: str | None = None, db: Session = Dep
 
 
         fulfill_paid_order(db, order)
+
+    elif order and order.status == "pendingPay" and order.psp == "stripe" and settings.stripe_secret_key.strip():
+
+        from app import stripe_service
+        from app.payments.fulfillment import fulfill_paid_order
+
+        try:
+            session = stripe_service.retrieve_checkout_session(session_id or order.psp_payment_id)
+        except Exception:
+            session = {}
+
+        if session.get("payment_status") == "paid" or session.get("status") == "complete":
+            order.payment_status = "succeeded"
+            order.psp_transaction_id = session.get("payment_intent") or session.get("id")
+            fulfill_paid_order(db, order)
 
     return {"ok": True, "orderId": orderId, "sessionId": session_id, "status": order.status if order else None}
 

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 from datetime import datetime, timezone
 
+import stripe
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -28,16 +27,15 @@ def _order_by_metadata(db: Session, order_id: int) -> Order | None:
 
 def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) -> bool:
     secret = settings.stripe_webhook_secret.strip()
-    if secret and signature:
-        parts = dict(item.split("=", 1) for item in signature.split(",") if "=" in item)
-        timestamp = parts.get("t", "")
-        v1 = parts.get("v1", "")
-        signed = f"{timestamp}.{payload.decode('utf-8')}"
-        expected = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, v1):
+    if secret:
+        if not signature:
             return False
-
-    event = json.loads(payload)
+        try:
+            event = stripe.Webhook.construct_event(payload, signature, secret)
+        except (ValueError, stripe.error.SignatureVerificationError):
+            return False
+    else:
+        event = json.loads(payload)
     event_type = event.get("type", "")
     data_object = event.get("data", {}).get("object", {})
     if event_type in ("payment_intent.succeeded", "checkout.session.completed"):
@@ -57,7 +55,10 @@ def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) ->
             fulfill_paid_order(db, order)
             dispatch_order_paid_push(db, order.id)
             return True
-    return False
+    # A valid Stripe event can legitimately refer to a PaymentIntent that was
+    # created outside HeyMarket (for example, `stripe trigger` fixtures). Acknowledge
+    # verified but irrelevant events so Stripe does not retry them indefinitely.
+    return True
 
 
 def handle_paypal_webhook(db: Session, payload: dict) -> bool:

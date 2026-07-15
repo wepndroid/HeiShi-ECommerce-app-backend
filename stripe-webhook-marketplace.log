@@ -1,0 +1,4 @@
+Forwarding Stripe test events to http://127.0.0.1:8001/v1/payments/webhooks/stripe
+Keep this window open during the escrow test.
+Checking for new versions...
+

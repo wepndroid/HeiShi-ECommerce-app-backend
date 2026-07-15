@@ -96,6 +96,21 @@ class WeChatAuthRequest(BaseModel):
     city: str | None = Field(default=None, min_length=1, max_length=100)
 
 
+class GoogleAuthRequest(BaseModel):
+    """Native Google login callback payload from the mobile app."""
+
+    idToken: str = Field(min_length=1, max_length=4096)
+    nickname: str | None = Field(default=None, min_length=1, max_length=50)
+    city: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class GoogleDevAuthRequest(BaseModel):
+    """Temporary local-dev fallback while Google Web OAuth client is unavailable."""
+
+    nickname: str | None = Field(default=None, min_length=1, max_length=50)
+    city: str | None = Field(default=None, min_length=1, max_length=100)
+
+
 # Catalog
 class SellerDto(BaseModel):
     id: str
@@ -246,6 +261,7 @@ class OrderDto(BaseModel):
         "pendingReview",
         "completed",
         "cancelled",
+        "refunded",
         "inDispute",
         "refundInProgress",
     ]
@@ -260,6 +276,7 @@ class OrderDto(BaseModel):
     discountAmount: float | None = None
     createdAt: str
     updatedAt: str
+    viewerHasReviewed: bool = False
 
 
 class ReviewCriteriaDto(BaseModel):
@@ -359,6 +376,8 @@ class ChatMessageDto(BaseModel):
     text: str
     sentAt: str
     ackRead: bool = False
+    kind: Literal["text", "priceChange"] = "text"
+    price: float | None = None
 
 
 class OpenConversationRequest(BaseModel):
@@ -645,7 +664,7 @@ class SubmitReportRequest(BaseModel):
     targetType: Literal["listing", "user", "chat", "order", "service"]
     targetId: str
     reason: str
-    details: str | None = None
+    details: str | None = Field(default=None, max_length=1000)
     evidenceUrls: list[str] = Field(default_factory=list)
 
 

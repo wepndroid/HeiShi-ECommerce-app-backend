@@ -274,7 +274,13 @@ def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
     )
 
 
-def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False) -> OrderDto:
+def order_to_dto(
+    order: Order,
+    lang: str = "en",
+    *,
+    include_buyer: bool = False,
+    viewer_has_reviewed: bool = False,
+) -> OrderDto:
     status = order.status if order.status in (
         "pendingPay",
         "pendingShip",
@@ -283,6 +289,7 @@ def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False)
         "pendingReview",
         "completed",
         "cancelled",
+        "refunded",
         "inDispute",
         "refundInProgress",
     ) else "pendingPay"
@@ -305,6 +312,7 @@ def order_to_dto(order: Order, lang: str = "en", *, include_buyer: bool = False)
         discountAmount=order.discount_amount if order.discount_amount else None,
         createdAt=iso(order.created_at),
         updatedAt=iso(order.updated_at),
+        viewerHasReviewed=viewer_has_reviewed,
     )
 
 
@@ -370,13 +378,24 @@ def message_to_dto(msg: Message, conv: Conversation | None = None, viewer_id: st
     ack_read = False
     if conv is not None and viewer_id is not None:
         ack_read = message_ack_read(conv, msg, viewer_id)
+    price = None
+    kind = "text"
+    if msg.text.startswith("__PRICE_CHANGE__:"):
+        try:
+            price = float(msg.text.split(":", 1)[1])
+            kind = "priceChange"
+        except (TypeError, ValueError):
+            price = None
+    text = f"Price updated to A${price:.2f}" if price is not None else msg.text
     return ChatMessageDto(
         id=msg.id,
         conversationId=msg.conversation_id,
         senderId=msg.sender_id,
-        text=msg.text,
+        text=text,
         sentAt=iso(msg.sent_at),
         ackRead=ack_read,
+        kind=kind,
+        price=price,
     )
 
 

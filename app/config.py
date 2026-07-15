@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # OTP as `devCode` (no real SMS provider wired yet). Set false in production once Twilio
     # is configured so codes are delivered by SMS only.
     expose_dev_otp: bool = True
+    # Local verification mode for development QA. When true, Twilio is bypassed even if
+    # Twilio credentials are present; the API stores a temporary local OTP and can expose
+    # it as `devCode` when EXPOSE_DEV_OTP is enabled.
+    sms_dev_otp: bool = False
     # Payments. When a Stripe secret key is present the real Stripe flow (SetupIntent /
     # PaymentSheet / Connect / PaymentIntent) activates; otherwise the API simulates
     # payments so local/offline dev keeps working. `payments_simulated` force-simulates
@@ -41,11 +45,18 @@ class Settings(BaseSettings):
     stripe_publishable_key: str = ""
     stripe_webhook_secret: str = ""
     default_charge_currency: str = "aud"
+    # Legal country for newly created Stripe Connect Express seller accounts.
+    # This is immutable after onboarding starts, so set it explicitly instead of
+    # allowing Stripe to inherit the platform account's country.
+    stripe_connect_country: str = "AU"
     # Stripe Connect onboarding return/refresh deep links (app scheme). Overridable per env.
     connect_return_url: str = "heishi://payout/connect/return"
     connect_refresh_url: str = "heishi://payout/connect/refresh"
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
+    # PayPal environment is independent from Stripe simulation. This allows Stripe
+    # test-mode API calls and PayPal sandbox API calls in the same escrow test stack.
+    paypal_sandbox: bool = True
     alipay_app_id: str = ""
     alipay_private_key: str = ""
     alipay_public_key: str = ""
@@ -97,6 +108,8 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""
+    google_oauth_client_id: str = ""
+    google_dev_auth_fallback: bool = False
 
     @property
     def supabase_auth_enabled(self) -> bool:
@@ -118,6 +131,10 @@ class Settings(BaseSettings):
             self.twilio_verify_service_sid.strip(),
         ]
         return any(values) and not self.twilio_verify_enabled
+
+    @property
+    def google_oauth_client_ids(self) -> list[str]:
+        return [value.strip() for value in self.google_oauth_client_id.split(",") if value.strip()]
 
     @property
     def cors_origin_list(self) -> list[str]:

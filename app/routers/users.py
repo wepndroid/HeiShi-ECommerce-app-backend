@@ -2,11 +2,13 @@ from datetime import datetime, timezone
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
+from app.admin_notifications import notify_admin
 from app.catalog_helpers import apply_public_listing_visibility_filter, get_or_create_settings
 from app.database import get_db
 from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, VerificationSubmission, ViewHistory
@@ -331,7 +333,7 @@ def _user_reviewed_order(db: Session, order_id: int, user_id: str) -> bool:
 
 
 def _pending_review_orders(db: Session, user_id: str, lang: str) -> list[PendingReviewOrderDto]:
-    reviewable_statuses = ("pendingReview", "completed")
+    reviewable_statuses = ("pendingReview", "completed", "refunded")
     pending: list[PendingReviewOrderDto] = []
 
     buyer_orders = (
@@ -375,7 +377,7 @@ def _pending_review_orders(db: Session, user_id: str, lang: str) -> list[Pending
 
 
 def _completion_rate(db: Session, user_id: str) -> float:
-    terminal = ("completed", "pendingReview", "cancelled")
+    terminal = ("completed", "pendingReview", "cancelled", "refunded")
     base = db.query(Order).filter(
         or_(Order.buyer_id == user_id, Order.seller_id == user_id),
         Order.status.in_(terminal),
@@ -473,18 +475,27 @@ def submit_verification(
             status_code=409,
             detail={"code": "ALREADY_PENDING", "message": "Verification already pending review", "details": {}},
         )
-    db.add(
-        VerificationSubmission(
-            user_id=user.id,
-            legal_name=body.legalName.strip(),
-            id_country=body.idCountry.upper(),
-            id_front_url=body.idFrontUrl.strip(),
-            id_back_url=body.idBackUrl.strip() if body.idBackUrl else None,
-            business_name=body.businessName.strip() if body.businessName else None,
-            business_reg_url=body.businessRegUrl.strip() if body.businessRegUrl else None,
-            abn=body.abn.strip() if body.abn else None,
-            status="pending",
-        )
+    submission = VerificationSubmission(
+        user_id=user.id,
+        legal_name=body.legalName.strip(),
+        id_country=body.idCountry.upper(),
+        id_front_url=body.idFrontUrl.strip(),
+        id_back_url=body.idBackUrl.strip() if body.idBackUrl else None,
+        business_name=body.businessName.strip() if body.businessName else None,
+        business_reg_url=body.businessRegUrl.strip() if body.businessRegUrl else None,
+        abn=body.abn.strip() if body.abn else None,
+        status="pending",
+    )
+    db.add(submission)
+    db.flush()
+    notify_admin(
+        db,
+        event_type="verification_submitted",
+        title="New verification submission",
+        body=f"{user.nickname} submitted identity documents for review.",
+        target_type="verification",
+        target_id=submission.id,
+        action_path=f"/verifications/{submission.id}",
     )
     db.commit()
     db.refresh(user)
@@ -992,12 +1003,34 @@ def create_payout_onboarding_link(user: User = Depends(get_current_user), db: Se
                 "details": {},
             },
         )
-    account_id = stripe_service.ensure_connect_account(user)
+    try:
+        account_id = stripe_service.ensure_connect_account(user)
+    except stripe_service.StripeConnectCountryMismatch as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PAYOUT_COUNTRY_MISMATCH",
+                "message": str(exc),
+                "details": {"requiredCountry": settings.stripe_connect_country.upper()},
+            },
+        ) from exc
     if user.stripe_connect_id != account_id:
         user.stripe_connect_id = account_id
         db.commit()
     url = stripe_service.create_account_onboarding_link(account_id)
     return ConnectOnboardingResponse(url=url, simulated=False)
+
+
+@payouts_router.get("/connect/return", include_in_schema=False)
+def payout_connect_return():
+    """Hand control from Stripe's required web callback back to the payout screen."""
+    return RedirectResponse("heishi:///settings/payout?stripeConnect=return", status_code=302)
+
+
+@payouts_router.get("/connect/refresh", include_in_schema=False)
+def payout_connect_refresh():
+    """Return to the payout screen so the seller can request a fresh Account Link."""
+    return RedirectResponse("heishi:///settings/payout?stripeConnect=refresh", status_code=302)
 
 
 @payouts_router.get("/connect/status", response_model=ConnectStatusResponse)

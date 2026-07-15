@@ -343,6 +343,20 @@ Current production value:
 DEFAULT_CHARGE_CURRENCY=aud
 ```
 
+### `STRIPE_CONNECT_COUNTRY`
+
+Purpose: immutable legal country assigned when creating new Stripe Connect Express
+seller accounts. For the current AUD-only seller payout rollout, this must be Australia.
+
+Current value:
+
+```env
+STRIPE_CONNECT_COUNTRY=AU
+```
+
+Changing this value does not update existing connected accounts. Any account created
+with the wrong country must be replaced before onboarding continues.
+
 ### `CONNECT_RETURN_URL`
 
 Purpose: app deep link after successful Stripe Connect onboarding.
@@ -376,6 +390,18 @@ Where to get it: PayPal Developer Dashboard.
 Purpose: PayPal API secret.
 
 Where to get it: PayPal Developer Dashboard.
+
+### `PAYPAL_SANDBOX`
+
+Purpose: selects the PayPal API environment independently from Stripe payment
+simulation. This must be `true` for PayPal sandbox credentials and `false` only
+for verified live PayPal credentials.
+
+Escrow test value:
+
+```env
+PAYPAL_SANDBOX=true
+```
 
 ## Alipay Payouts
 

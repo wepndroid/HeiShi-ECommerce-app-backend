@@ -13,6 +13,9 @@ class CheckoutResult:
     client_secret: str | None = None
     checkout_url: str | None = None
     psp_payment_id: str | None = None
+    publishable_key: str | None = None
+    customer_id: str | None = None
+    ephemeral_key: str | None = None
 
 
 class PaymentAdapter(Protocol):
@@ -28,4 +31,5 @@ class PaymentAdapter(Protocol):
         payment_method: str,
         customer_id: str | None = None,
         payment_method_id: str | None = None,
+        native_payment_sheet: bool = False,
     ) -> CheckoutResult: ...

@@ -7,6 +7,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
+from app.admin_notifications import notify_admin
 from app.blocklist_helpers import users_blocked
 from app.catalog_helpers import (
     apply_bundle_item_payment,
@@ -170,6 +171,20 @@ def _bundle_has_on_hold_items(listing: Listing) -> bool:
     )
 
 
+def _reviewed_order_ids(db: Session, user_id: str, orders: list[Order]) -> set[int]:
+    order_ids = [order.id for order in orders]
+    if not order_ids:
+        return set()
+    return {
+        order_id
+        for (order_id,) in (
+            db.query(Review.order_id)
+            .filter(Review.reviewer_id == user_id, Review.order_id.in_(order_ids))
+            .all()
+        )
+    }
+
+
 @router.get("", response_model=Paginated[OrderDto])
 def list_orders(
     request: Request,
@@ -194,7 +209,13 @@ def list_orders(
     q = q.order_by(Order.created_at.desc())
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([order_to_dto(o, lang) for o in items], page, pageSize, total)
+    reviewed_ids = _reviewed_order_ids(db, user.id, items)
+    return paginate(
+        [order_to_dto(o, lang, viewer_has_reviewed=o.id in reviewed_ids) for o in items],
+        page,
+        pageSize,
+        total,
+    )
 
 
 @router.get("/sales", response_model=Paginated[OrderDto])
@@ -221,14 +242,33 @@ def list_sales(
     q = q.order_by(Order.updated_at.desc())
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
-    return paginate([order_to_dto(o, lang, include_buyer=True) for o in items], page, pageSize, total)
+    reviewed_ids = _reviewed_order_ids(db, user.id, items)
+    return paginate(
+        [
+            order_to_dto(
+                o,
+                lang,
+                include_buyer=True,
+                viewer_has_reviewed=o.id in reviewed_ids,
+            )
+            for o in items
+        ],
+        page,
+        pageSize,
+        total,
+    )
 
 
 @router.get("/{order_id}", response_model=OrderDto)
 def get_order(order_id: int, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     order = _get_participant_order(db, order_id, user.id)
     include_buyer = order.seller_id == user.id
-    return order_to_dto(order, get_accept_language(request), include_buyer=include_buyer)
+    return order_to_dto(
+        order,
+        get_accept_language(request),
+        include_buyer=include_buyer,
+        viewer_has_reviewed=order.id in _reviewed_order_ids(db, user.id, [order]),
+    )
 
 
 @router.post("", response_model=OrderDto, status_code=201)
@@ -608,6 +648,15 @@ def request_refund(
             detail={"code": "INVALID_STATE", "message": "Refund cannot be requested for this order", "details": {}},
         )
     _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
+    notify_admin(
+        db,
+        event_type="refund_requested",
+        title="New refund request",
+        body=f"{user.nickname} requested a refund for order #{order.id}.",
+        target_type="order",
+        target_id=order.id,
+        action_path=f"/orders/{order.id}",
+    )
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
@@ -633,6 +682,15 @@ def open_dispute(
             detail={"code": "INVALID_STATE", "message": "Order cannot enter dispute in current state", "details": {}},
         )
     _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
+    notify_admin(
+        db,
+        event_type="dispute_opened",
+        title="New order dispute",
+        body=f"{user.nickname} opened a dispute for order #{order.id}.",
+        target_type="order",
+        target_id=order.id,
+        action_path=f"/orders/{order.id}",
+    )
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
@@ -707,7 +765,7 @@ def submit_review(
     db: Session = Depends(get_db),
 ):
     order = _get_participant_order(db, order_id, user.id)
-    if order.status not in ("pendingReview", "completed"):
+    if order.status not in ("pendingReview", "completed", "refunded"):
         raise HTTPException(
             status_code=400,
             detail={"code": "INVALID_STATE", "message": "Order is not open for review", "details": {}},
@@ -734,6 +792,15 @@ def submit_review(
         review.expertise_rating = criteria.trustement
     db.add(review)
     db.flush()
+    notify_admin(
+        db,
+        event_type="review_submitted",
+        title="New review submitted",
+        body=f"{user.nickname} reviewed order #{order.id}.",
+        target_type="review",
+        target_id=review.id,
+        action_path=f"/reviews/{review.id}",
+    )
     _maybe_complete_order_after_review(db, order)
     db.commit()
     return Response(status_code=204)

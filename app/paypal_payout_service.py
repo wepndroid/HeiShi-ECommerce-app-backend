@@ -12,7 +12,7 @@ class PayPalPayoutError(RuntimeError):
 
 
 def _base_url() -> str:
-    return "https://api-m.sandbox.paypal.com" if settings.payments_simulated else "https://api-m.paypal.com"
+    return "https://api-m.sandbox.paypal.com" if settings.paypal_sandbox else "https://api-m.paypal.com"
 
 
 def _credentials() -> tuple[str, str]:

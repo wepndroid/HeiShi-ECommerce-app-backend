@@ -39,6 +39,8 @@ from app.twilio_otp import TwilioOtpError, send_sms_verification, verify_sms_cod
 from app.schemas import (
     AuthTokensDto,
     AuthUserDto,
+    GoogleDevAuthRequest,
+    GoogleAuthRequest,
     LoginRequest,
     LoginOtpRequest,
     RefreshRequest,
@@ -66,6 +68,7 @@ supabase_security = HTTPBearer(auto_error=False)
 KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.cities}
 WECHAT_ACCESS_TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token"
 WECHAT_USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo"
+GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
 
 def _valid_avatar_url(url: str) -> bool:
@@ -87,6 +90,24 @@ def _wechat_not_configured() -> HTTPException:
 
 
 def _wechat_error(message: str, *, status_code: int = 400, code: str = "WECHAT_AUTH_FAILED") -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message, "details": {}},
+    )
+
+
+def _google_not_configured() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "GOOGLE_NOT_CONFIGURED",
+            "message": "Google login is not configured",
+            "details": {},
+        },
+    )
+
+
+def _google_error(message: str, *, status_code: int = 400, code: str = "GOOGLE_AUTH_FAILED") -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail={"code": code, "message": message, "details": {}},
@@ -153,12 +174,136 @@ def _wechat_exchange_code(code: str) -> dict:
     }
 
 
+def _google_exchange_id_token(id_token: str) -> dict:
+    audiences = set(settings.google_oauth_client_ids)
+    if not audiences:
+        raise _google_not_configured()
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(
+                GOOGLE_TOKENINFO_URL,
+                params={"id_token": id_token.strip()},
+            )
+            payload = response.json()
+    except Exception as exc:
+        raise _google_error(
+            "Could not reach Google login service",
+            status_code=502,
+            code="GOOGLE_NETWORK_ERROR",
+        ) from exc
+
+    if response.status_code >= 400:
+        message = payload.get("error_description") or payload.get("error") or "Google login failed"
+        raise _google_error(str(message), status_code=401, code="GOOGLE_TOKEN_INVALID")
+
+    audience = str(payload.get("aud") or "").strip()
+    if audience not in audiences:
+        raise _google_error("Google token audience mismatch", status_code=401, code="GOOGLE_TOKEN_INVALID")
+
+    issuer = str(payload.get("iss") or "").strip()
+    if issuer not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise _google_error("Google token issuer mismatch", status_code=401, code="GOOGLE_TOKEN_INVALID")
+
+    sub = str(payload.get("sub") or "").strip()
+    if not sub:
+        raise _google_error("Google token is missing subject", status_code=401, code="GOOGLE_TOKEN_INVALID")
+
+    exp_raw = str(payload.get("exp") or "").strip()
+    if exp_raw.isdigit():
+        expires_at = datetime.fromtimestamp(int(exp_raw), tz=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            raise _google_error("Google token expired", status_code=401, code="GOOGLE_TOKEN_INVALID")
+
+    email = str(payload.get("email") or "").strip().lower() or None
+    email_verified = str(payload.get("email_verified") or "").strip().lower() == "true"
+    picture = str(payload.get("picture") or "").strip() or None
+    if picture and not _valid_avatar_url(picture):
+        picture = None
+
+    return {
+        "sub": sub,
+        "email": email,
+        "email_verified": email_verified,
+        "name": str(payload.get("name") or "").strip() or None,
+        "given_name": str(payload.get("given_name") or "").strip() or None,
+        "picture": picture,
+        "hosted_domain": str(payload.get("hd") or "").strip() or None,
+    }
+
+
 def _find_wechat_user(db: Session, openid: str, unionid: str | None) -> User | None:
     if unionid:
         user = db.query(User).filter(User.wechat_unionid == unionid).first()
         if user:
             return user
     return db.query(User).filter(User.wechat_openid == openid).first()
+
+
+def _find_google_user(
+    db: Session,
+    google_sub: str,
+    email: str | None,
+    *,
+    email_verified: bool,
+    hosted_domain: str | None,
+) -> User | None:
+    user = db.query(User).filter(User.google_sub == google_sub).first()
+    if user:
+        return user
+    if not email or not email_verified:
+        return None
+
+    email_is_google_authoritative = email.endswith("@gmail.com") or bool(hosted_domain)
+    if not email_is_google_authoritative:
+        return None
+    return db.query(User).filter(User.email == email).first()
+
+
+def _apply_google_profile_to_user(user: User, profile: dict) -> None:
+    google_sub = profile["sub"]
+    email = profile.get("email")
+    email_verified = bool(profile.get("email_verified"))
+    avatar_url = profile.get("picture")
+
+    user.google_sub = google_sub
+    if email and (not user.email or user.email == email):
+        user.email = email
+    if email_verified:
+        user.email_verified = True
+    if avatar_url and not user.avatar_url:
+        user.avatar_url = avatar_url
+
+
+def _create_google_user(db: Session, body: GoogleAuthRequest, profile: dict) -> User:
+    google_sub = profile["sub"]
+    email = profile.get("email")
+    nickname = (
+        (body.nickname.strip() if body.nickname else None)
+        or profile.get("name")
+        or profile.get("given_name")
+        or (email.split("@")[0] if email else None)
+        or "Google user"
+    )
+    city = _valid_optional_city(body.city)
+    heishi_seed = (email or google_sub).replace("@", "").replace(".", "")
+    user = User(
+        nickname=nickname[:50],
+        phone=None,
+        email=email,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        heishi_id=generate_heishi_id(db, heishi_seed),
+        city=city,
+        avatar_url=profile.get("picture"),
+        phone_verified=False,
+        email_verified=bool(profile.get("email_verified")),
+        google_sub=google_sub,
+    )
+    db.add(user)
+    db.flush()
+    get_or_create_settings(db, user.id)
+    issue_welcome_coupon(db, user.id, user.language)
+    return user
 
 
 def _valid_optional_city(raw_city: str | None) -> str | None:
@@ -381,6 +526,110 @@ def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
     return _issue_tokens(db, user)
 
 
+@router.post("/google/login", response_model=AuthTokensDto)
+def google_login(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Sign in an existing account via native Google Sign-In ID token."""
+
+    profile = _google_exchange_id_token(body.idToken)
+    google_sub = profile["sub"]
+    email = profile.get("email")
+    email_verified = bool(profile.get("email_verified"))
+    user = _find_google_user(
+        db,
+        google_sub,
+        email,
+        email_verified=email_verified,
+        hosted_domain=profile.get("hosted_domain"),
+    )
+
+    if user is None:
+        raise _google_error(
+            "Google account is not registered",
+            status_code=404,
+            code="GOOGLE_ACCOUNT_NOT_REGISTERED",
+        )
+
+    _apply_google_profile_to_user(user, profile)
+    db.commit()
+    db.refresh(user)
+    return _issue_tokens(db, user)
+
+
+@router.post("/google/register", response_model=AuthTokensDto)
+def google_register(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Register a new account via native Google Sign-In ID token."""
+
+    profile = _google_exchange_id_token(body.idToken)
+    google_sub = profile["sub"]
+    email = profile.get("email")
+    email_verified = bool(profile.get("email_verified"))
+    user = _find_google_user(
+        db,
+        google_sub,
+        email,
+        email_verified=email_verified,
+        hosted_domain=profile.get("hosted_domain"),
+    )
+
+    if user is not None:
+        _apply_google_profile_to_user(user, profile)
+        db.commit()
+        raise _google_error(
+            "Google account is already registered",
+            status_code=409,
+            code="GOOGLE_ACCOUNT_ALREADY_REGISTERED",
+        )
+
+    user = _create_google_user(db, body, profile)
+    db.commit()
+    db.refresh(user)
+    return _issue_tokens(db, user)
+
+
+@router.post("/google", response_model=AuthTokensDto)
+def google_login_legacy(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Backward-compatible strict Google login endpoint."""
+
+    return google_login(body, db)
+
+
+@router.post("/google/dev-register", response_model=AuthTokensDto)
+def google_dev_register(body: GoogleDevAuthRequest, db: Session = Depends(get_db)):
+    """Temporary local-dev fallback for Google registration.
+
+    This exists only so mobile QA can continue while the real Google Web
+    OAuth client ID is missing. It does not verify a Google identity and must
+    stay disabled outside local development.
+    """
+
+    if not settings.google_dev_auth_fallback:
+        raise _google_not_configured()
+
+    nickname = (body.nickname.strip() if body.nickname else None) or "Google dev user"
+    city = _valid_optional_city(body.city)
+    seed = secrets.token_hex(8)
+    email = f"google-dev-{seed}@local.test"
+    user = User(
+        nickname=nickname[:50],
+        phone=None,
+        email=email,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        heishi_id=generate_heishi_id(db, seed),
+        city=city,
+        avatar_url=None,
+        phone_verified=False,
+        email_verified=True,
+        google_sub=f"dev-google-{seed}",
+    )
+    db.add(user)
+    db.flush()
+    get_or_create_settings(db, user.id)
+    issue_welcome_coupon(db, user.id, user.language)
+    db.commit()
+    db.refresh(user)
+    return _issue_tokens(db, user)
+
+
 def _validation_error(message: str = "Invalid phone format") -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -427,6 +676,14 @@ def _twilio_http_error(exc: TwilioOtpError) -> HTTPException:
     )
 
 
+def _should_use_twilio_verify() -> bool:
+    return settings.twilio_verify_enabled and not settings.sms_dev_otp
+
+
+def _should_block_partial_twilio_config() -> bool:
+    return settings.twilio_verify_partially_configured and not settings.sms_dev_otp
+
+
 def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
     access = create_access_token(user.id)
     refresh = create_refresh_token()
@@ -449,7 +706,7 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
             detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
         )
 
-    if settings.twilio_verify_partially_configured:
+    if _should_block_partial_twilio_config():
         raise HTTPException(
             status_code=503,
             detail={
@@ -458,7 +715,7 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
                 "details": {},
             },
         )
-    if settings.twilio_verify_enabled:
+    if _should_use_twilio_verify():
         try:
             send_sms_verification(phone)
         except TwilioOtpError as exc:
@@ -505,7 +762,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
             status_code=409,
             detail={"code": "PHONE_TAKEN", "message": "Phone number already registered", "details": {}},
         )
-    if settings.twilio_verify_partially_configured:
+    if _should_block_partial_twilio_config():
         raise HTTPException(
             status_code=503,
             detail={
@@ -514,7 +771,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
                 "details": {},
             },
         )
-    if settings.twilio_verify_enabled:
+    if _should_use_twilio_verify():
         try:
             verify_sms_code(phone, body.verificationCode.strip())
         except TwilioOtpError as exc:
@@ -586,7 +843,7 @@ def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
             status_code=404,
             detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
         )
-    if settings.twilio_verify_partially_configured:
+    if _should_block_partial_twilio_config():
         raise HTTPException(
             status_code=503,
             detail={
@@ -595,7 +852,7 @@ def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
                 "details": {},
             },
         )
-    if settings.twilio_verify_enabled:
+    if _should_use_twilio_verify():
         try:
             send_sms_verification(phone)
         except TwilioOtpError as exc:
@@ -638,7 +895,7 @@ def send_login_code(body: SendRegisterCodeRequest, db: Session = Depends(get_db)
 @router.post("/login/verify", response_model=AuthTokensDto)
 def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
     phone = _require_valid_phone(body.phone)
-    if settings.twilio_verify_partially_configured:
+    if _should_block_partial_twilio_config():
         raise HTTPException(
             status_code=503,
             detail={
@@ -647,7 +904,7 @@ def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
                 "details": {},
             },
         )
-    if settings.twilio_verify_enabled:
+    if _should_use_twilio_verify():
         try:
             verify_sms_code(phone, body.verificationCode.strip())
         except TwilioOtpError as exc:

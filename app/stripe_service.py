@@ -12,9 +12,11 @@ Flows (per Stripe's official React Native guidance):
 """
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from app.config import settings
 
-try:  # stripe is optional until the client provides keys
+try:  # Dependency is pinned in requirements; keep startup tolerant for simulated mode.
     import stripe  # type: ignore
 except Exception:  # pragma: no cover
     stripe = None  # type: ignore
@@ -25,6 +27,10 @@ STRIPE_API_VERSION = "2024-06-20"
 
 class StripeNotConfigured(RuntimeError):
     """Raised when a real Stripe call is attempted without configuration."""
+
+
+class StripeConnectCountryMismatch(RuntimeError):
+    """A completed connected account has a different immutable legal country."""
 
 
 def _client():
@@ -92,26 +98,60 @@ def detach_payment_method(payment_method_id: str) -> None:
 # --- Connect Express (seller payouts) ------------------------------------------------
 
 def ensure_connect_account(user) -> str:
+    """Return a correctly configured seller account.
+
+    Stripe Connect account country is immutable after onboarding. Replace an existing
+    wrong-country account only while it is still incomplete; never silently replace a
+    completed payout identity.
+    """
     existing = getattr(user, "stripe_connect_id", None)
-    if existing:
-        return existing
+    target_country = settings.stripe_connect_country.strip().upper()
     s = _client()
+    if existing:
+        account = s.Account.retrieve(existing)
+        existing_country = str(account.get("country") or "").upper()
+        if existing_country == target_country:
+            return existing
+        if account.get("details_submitted") or account.get("payouts_enabled"):
+            raise StripeConnectCountryMismatch(
+                f"Connected account country {existing_country or 'unknown'} does not match {target_country}"
+            )
     account = s.Account.create(
         type="express",
+        country=target_country,
         email=getattr(user, "email", None) or None,
-        capabilities={"transfers": {"requested": True}},
+        # Stripe requires AU Express accounts that request `transfers` to request
+        # `card_payments` as well, even though this marketplace charges buyers on
+        # the platform and uses separate transfers for seller release.
+        capabilities={
+            "card_payments": {"requested": True},
+            "transfers": {"requested": True},
+        },
         business_type="individual",
         metadata={"app_user_id": user.id},
     )
     return account["id"]
 
 
+def _connect_web_callback(configured_url: str, action: str) -> str:
+    """Return an Account Link callback Stripe accepts.
+
+    Stripe requires an HTTP(S) return/refresh URL and rejects app schemes such as
+    ``heishi://``. For those configured app links, route through the backend and let
+    that web endpoint hand control back to the mobile app.
+    """
+    parsed = urlparse(configured_url.strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return configured_url.strip()
+    return f"{settings.base_url.rstrip('/')}/v1/payouts/connect/{action}"
+
+
 def create_account_onboarding_link(account_id: str) -> str:
     link = _client().AccountLink.create(
         account=account_id,
         type="account_onboarding",
-        refresh_url=settings.connect_refresh_url,
-        return_url=settings.connect_return_url,
+        refresh_url=_connect_web_callback(settings.connect_refresh_url, "refresh"),
+        return_url=_connect_web_callback(settings.connect_return_url, "return"),
     )
     return link["url"]
 
@@ -149,6 +189,38 @@ def create_and_confirm_payment_intent(
     if transfer_group:
         params["transfer_group"] = transfer_group
     return s.PaymentIntent.create(**params)
+
+
+def create_payment_sheet_intent(
+    *,
+    amount_minor: int,
+    currency: str,
+    customer_id: str,
+    description: str | None = None,
+    metadata: dict | None = None,
+    transfer_group: str | None = None,
+) -> dict:
+    """Create an unconfirmed card PaymentIntent for native mobile PaymentSheet."""
+    params: dict = {
+        "amount": amount_minor,
+        "currency": currency,
+        "customer": customer_id,
+        "description": description,
+        "metadata": metadata or {},
+        "payment_method_types": ["card"],
+        "setup_future_usage": "off_session",
+    }
+    if transfer_group:
+        params["transfer_group"] = transfer_group
+    return _client().PaymentIntent.create(**params)
+
+
+def create_customer_ephemeral_key(customer_id: str) -> str:
+    key = _client().EphemeralKey.create(
+        customer=customer_id,
+        stripe_version=STRIPE_API_VERSION,
+    )
+    return key["secret"]
 
 
 def retrieve_payment_intent(payment_intent_id: str) -> dict:

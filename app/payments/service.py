@@ -25,7 +25,13 @@ def amount_to_minor(amount: float) -> int:
     return int(round(amount * 100))
 
 
-def start_checkout(order: Order, *, payment_method: str, db: Session | None = None) -> CheckoutResult:
+def start_checkout(
+    order: Order,
+    *,
+    payment_method: str,
+    db: Session | None = None,
+    native_payment_sheet: bool = False,
+) -> CheckoutResult:
     adapter = resolve_adapter(payment_method)
     currency = (order.charge_currency or "aud").lower()
     total = order.amount + (order.escrow_fee or 0.0)
@@ -35,6 +41,12 @@ def start_checkout(order: Order, *, payment_method: str, db: Session | None = No
     if payment_method == "card" and db is not None and adapter.psp == "stripe":
         buyer = db.query(User).filter(User.id == order.buyer_id).first()
         customer_id = getattr(buyer, "stripe_customer_id", None) if buyer else None
+        if native_payment_sheet and buyer and not customer_id:
+            from app import stripe_service
+
+            customer_id = stripe_service.ensure_customer(buyer)
+            buyer.stripe_customer_id = customer_id
+            db.flush()
         pm = (
             db.query(PaymentMethod)
             .filter(
@@ -53,6 +65,7 @@ def start_checkout(order: Order, *, payment_method: str, db: Session | None = No
         payment_method=payment_method,
         customer_id=customer_id,
         payment_method_id=payment_method_id,
+        native_payment_sheet=native_payment_sheet,
     )
 
 

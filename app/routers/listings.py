@@ -1,16 +1,19 @@
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_accept_language, get_current_user
+from app.admin_notifications import notify_admin
 from app.catalog_helpers import compute_purchase_available, reset_bundle_meta_for_resale
 from app.config import settings
 from app.database import get_db
-from app.models import Conversation, Favorite, Listing, Order, User, ViewHistory
+from app.messaging_read import bump_unread_for_recipient
+from app.models import Conversation, Favorite, Listing, Message, Order, User, ViewHistory
 from app.moderation import find_blocked_keyword
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
@@ -188,7 +191,18 @@ def get_mine(
 ):
     lang = get_accept_language(request)
     q = db.query(Listing).options(joinedload(Listing.seller)).filter(Listing.seller_id == user.id)
-    if status:
+    if status == "active":
+        q = q.filter(Listing.status == "active", Listing.review_status == "approved")
+    elif status == "inactive":
+        q = q.filter(
+            or_(
+                Listing.status == "inactive",
+                and_(Listing.status == "active", Listing.review_status.in_(("pendingReview", "rejected", "removed"))),
+            )
+        )
+    elif status == "draft":
+        q = q.filter(Listing.status == "draft")
+    elif status:
         q = q.filter(Listing.status == status)
     else:
         q = q.filter(Listing.status.in_(["active", "draft", "inactive"]))
@@ -364,6 +378,17 @@ def create_listing(
             require_review_on_pass=True,
         )
     db.add(listing)
+    db.flush()
+    if not is_draft and listing.review_status == "pendingReview":
+        notify_admin(
+            db,
+            event_type="listing_pending_review",
+            title="New listing requires review",
+            body=f'{user.nickname} posted "{listing.title}".',
+            target_type="listing",
+            target_id=listing.id,
+            action_path=f"/products/{listing.id}",
+        )
     db.commit()
     db.refresh(listing)
     listing.seller = user
@@ -405,6 +430,7 @@ def update_listing(
     if listing.status == "sold":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Cannot edit sold listing", "details": {}})
     data = body.model_dump(exclude_unset=True)
+    previous_price = listing.price
     material_keys = {"title", "description", "price", "imageUrls"} & data.keys()
     if material_keys:
         open_order = (
@@ -428,6 +454,7 @@ def update_listing(
         "locationLabel": "location_label",
     }
     previous_status = listing.status
+    previous_review_status = listing.review_status
     content_changed = False
     for key, val in data.items():
         if key == "type" and val is not None and val != listing.type:
@@ -528,6 +555,7 @@ def update_listing(
             and listing.status == "active"
             and listing.review_status == "draft"
         )
+        or previous_review_status in ("rejected", "removed")
     ):
         _apply_keyword_moderation(
             db,
@@ -536,6 +564,33 @@ def update_listing(
             description=listing.description,
             require_review_on_pass=True,
         )
+    if listing.review_status == "pendingReview" and previous_review_status != "pendingReview":
+        notify_admin(
+            db,
+            event_type="listing_pending_review",
+            title="Listing resubmitted for review",
+            body=f'{user.nickname} resubmitted "{listing.title}".',
+            target_type="listing",
+            target_id=listing.id,
+            action_path=f"/products/{listing.id}",
+        )
+    price_changed = "price" in data and abs(float(listing.price) - float(previous_price)) > 0.001
+    if price_changed:
+        now = datetime.now(timezone.utc)
+        notice_text = f"__PRICE_CHANGE__:{float(listing.price):.2f}"
+        conversations = db.query(Conversation).filter(Conversation.listing_id == listing.id).all()
+        for conversation in conversations:
+            message = Message(
+                conversation_id=conversation.id,
+                sender_id=user.id,
+                text=notice_text,
+                sent_at=now,
+            )
+            conversation.last_message_text = f"Price updated to A${float(listing.price):.2f}"
+            conversation.last_message_at = now
+            db.add(message)
+            db.flush()
+            bump_unread_for_recipient(db, conversation, user.id)
     db.commit()
     db.refresh(listing)
     return listing_to_summary(listing)

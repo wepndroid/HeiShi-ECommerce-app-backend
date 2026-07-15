@@ -75,7 +75,7 @@ def regions_from_db(db: Session) -> list[RegionDto]:
         .all()
     )
     if not rows:
-        return REGION_DATA
+        return []
 
     by_state: dict[str, dict[str, dict]] = {}
     state_names = {r.state: r.stateName for r in REGION_DATA}
@@ -112,7 +112,7 @@ def regions_from_db(db: Session) -> list[RegionDto]:
                 cities=cities,
             )
         )
-    return result or REGION_DATA
+    return result
 
 
 def banners_from_db(db: Session, position: str = "home") -> list[dict]:

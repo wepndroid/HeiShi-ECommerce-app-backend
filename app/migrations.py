@@ -247,6 +247,7 @@ def _sqlite_migrate_mvp_admin_v2(engine: Engine) -> None:
         ("is_flagged", "is_flagged BOOLEAN DEFAULT 0"),
         ("flag_reason", "flag_reason TEXT"),
         ("email_verified", "email_verified BOOLEAN DEFAULT 0"),
+        ("google_sub", "google_sub VARCHAR(100)"),
     )
     for col, ddl in user_cols:
         _sqlite_add_column_if_missing(engine, "users", col, ddl)
