@@ -93,12 +93,8 @@ def apply_feed_sort(q: Query) -> Query:
 
 
 def exclude_unpaid_reserved(q: Query, db: Session, viewer_user_id: str | None = None) -> Query:
-    """Hide listings reserved by another buyer's unpaid checkout."""
-    reserved = db.query(Order.listing_id).filter(Order.status == PENDING_PAY_STATUS)
-    if viewer_user_id:
-        reserved = reserved.filter(Order.buyer_id != viewer_user_id)
-    reserved_ids = reserved.distinct().subquery()
-    return q.filter(~Listing.id.in_(db.query(reserved_ids.c.listing_id)))
+    """Keep unpaid checkout attempts visible; successful payment owns inventory."""
+    return q
 
 
 def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None) -> Query:
@@ -304,9 +300,7 @@ def listing_has_pending_pay(db: Session, listing_id: int) -> bool:
 
 def compute_purchase_available(db: Session, listing: Listing) -> bool:
     checkout_amount = listing_checkout_amount(listing)
-    if listing.status != "active" or checkout_amount <= 0:
-        return False
-    return not listing_has_pending_pay(db, listing.id)
+    return listing.status == "active" and checkout_amount > 0
 
 
 def get_or_create_settings(db: Session, user_id: str):

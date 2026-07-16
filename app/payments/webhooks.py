@@ -86,4 +86,7 @@ def handle_paypal_webhook(db: Session, payload: dict) -> bool:
             fulfill_paid_order(db, order)
             dispatch_order_paid_push(db, order.id)
             return True
-    return False
+    # Signature verification happens at the route boundary. A verified event may
+    # legitimately belong to a sandbox fixture or an unrelated PayPal order, so
+    # acknowledge it to prevent needless retries.
+    return True

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
 
 from pydantic import BaseModel, Field
 
@@ -25,7 +26,7 @@ from app.config import settings
 
 from app.database import get_db
 
-from app.models import Order, User
+from app.models import Listing, Order, User
 from app.payments.paypal_adapter import PayPalAdapter
 
 from app.payments.service import apply_checkout_to_order, start_checkout
@@ -35,6 +36,15 @@ from app.payments.webhooks import handle_paypal_webhook, handle_stripe_webhook
 
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+
+
+def _orders_app_redirect(*, status: str | None, payment_result: str) -> RedirectResponse:
+    """Return hosted checkout users to the native order list instead of raw API JSON."""
+    order_filter = status if status in {"pendingShip", "pendingService"} else "all"
+    return RedirectResponse(
+        url=f"heishi:///profile/orders?filter={order_filter}&payment={payment_result}",
+        status_code=302,
+    )
 
 
 
@@ -106,6 +116,25 @@ def create_checkout(
 
             detail={"code": "INVALID_STATE", "message": "Order is not pending payment", "details": {}},
 
+        )
+
+    listing = (
+        db.query(Listing)
+        .filter(Listing.id == order.listing_id)
+        .with_for_update()
+        .first()
+    )
+    listing_available = bool(listing and listing.status == "active")
+    if listing_available and order.bundle_item_id:
+        from app.catalog_helpers import bundle_item_is_available, find_bundle_item
+
+        listing_available = bundle_item_is_available(find_bundle_item(listing, order.bundle_item_id) or {})
+    if not listing_available:
+        order.status = "cancelled"
+        db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "LISTING_UNAVAILABLE", "message": "Listing was purchased by another buyer", "details": {}},
         )
 
     try:
@@ -218,7 +247,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
 async def paypal_webhook(request: Request, db: Session = Depends(get_db)):
 
-    payload = json.loads(await request.body())
+    try:
+        payload = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail={"code": "WEBHOOK_REJECTED", "message": "Invalid JSON", "details": {}})
+
+    paypal = PayPalAdapter()
+    if not paypal.verify_webhook_signature(dict(request.headers), payload):
+        raise HTTPException(status_code=400, detail={"code": "WEBHOOK_REJECTED", "message": "Invalid PayPal signature", "details": {}})
 
     if not handle_paypal_webhook(db, payload):
 
@@ -250,7 +286,10 @@ def paypal_return(orderId: int, db: Session = Depends(get_db)):
 
         try:
 
-            payload = PayPalAdapter().capture_order(order.psp_payment_id)
+            payload = PayPalAdapter().capture_order(
+                order.psp_payment_id,
+                payee_merchant_id=order.paypal_payee_merchant_id,
+            )
 
         except RuntimeError as exc:
 
@@ -286,7 +325,13 @@ def paypal_return(orderId: int, db: Session = Depends(get_db)):
 
             fulfill_paid_order(db, order)
 
-    return {"ok": True, "orderId": orderId, "status": order.status if order else None}
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ORDER_NOT_FOUND", "message": "Order not found", "details": {}},
+        )
+    result = "success" if order.payment_status == "succeeded" else "pending"
+    return _orders_app_redirect(status=order.status, payment_result=result)
 
 
 
@@ -306,7 +351,12 @@ def paypal_cancel(orderId: int, db: Session = Depends(get_db)):
 
         db.commit()
 
-    return {"ok": True, "orderId": orderId, "status": order.status if order else None}
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ORDER_NOT_FOUND", "message": "Order not found", "details": {}},
+        )
+    return _orders_app_redirect(status=order.status, payment_result="cancelled")
 
 
 
@@ -343,7 +393,13 @@ def stripe_return(orderId: int, session_id: str | None = None, db: Session = Dep
             order.psp_transaction_id = session.get("payment_intent") or session.get("id")
             fulfill_paid_order(db, order)
 
-    return {"ok": True, "orderId": orderId, "sessionId": session_id, "status": order.status if order else None}
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ORDER_NOT_FOUND", "message": "Order not found", "details": {}},
+        )
+    result = "success" if order.payment_status == "succeeded" else "pending"
+    return _orders_app_redirect(status=order.status, payment_result=result)
 
 
 
@@ -363,4 +419,9 @@ def stripe_cancel(orderId: int, db: Session = Depends(get_db)):
 
         db.commit()
 
-    return {"ok": True, "orderId": orderId, "status": order.status if order else None}
+    if not order:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ORDER_NOT_FOUND", "message": "Order not found", "details": {}},
+        )
+    return _orders_app_redirect(status=order.status, payment_result="cancelled")

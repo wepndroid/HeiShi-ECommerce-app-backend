@@ -2,8 +2,10 @@
 __pycache__/
 *.py[cod]
 *.db
+*.log
 .env
 production.env
+tools/cloudflared.exe
 uploads/*
 !uploads/.gitkeep
 heishi.db

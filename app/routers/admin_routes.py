@@ -1493,7 +1493,19 @@ def resolve_dispute(
     elif body.resolution == "complete":
         order.status = "completed"
         order.payout_paused = False
-        release_payout_for_order(db, order)
+        payout_transition = release_payout_for_order(db, order)
+        if payout_transition.status != "released":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": payout_transition.code or "PAYOUT_RELEASE_FAILED",
+                    "message": payout_transition.reason or "Seller payout could not be released",
+                    "details": {
+                        "status": payout_transition.status,
+                        "reference": payout_transition.reference,
+                    },
+                },
+            )
     order.updated_at = datetime.now(timezone.utc)
     log_admin_action(
         db,

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app import (
     alipay_payout_service,
+    paypal_partner_service,
     paypal_payout_service,
     stripe_service,
     wechat_payout_service,
@@ -67,7 +68,7 @@ def _preferred_method(db: Session, seller_id: str, method_type: str) -> PayoutMe
     )
 
 
-def _preferred_release_method(db: Session, seller_id: str) -> PayoutMethod | None:
+def _preferred_release_method(db: Session, seller_id: str, payment_provider: str | None) -> PayoutMethod | None:
     rows = (
         db.query(PayoutMethod)
         .filter(PayoutMethod.user_id == seller_id)
@@ -76,6 +77,23 @@ def _preferred_release_method(db: Session, seller_id: str) -> PayoutMethod | Non
     )
     if not rows:
         return None
+
+    # Route each payout on the same rail that collected that order's buyer
+    # payment. This lets one seller receive concurrent Stripe and PayPal orders
+    # without manually changing a global default between releases.
+    provider_method_types = {
+        "stripe": {"bank"},
+        "paypal": {"paypal"},
+        "alipay": {"alipay"},
+        "wechat": {"wechat"},
+    }
+    required_types = provider_method_types.get((payment_provider or "").strip().lower())
+    if required_types:
+        matching = [row for row in rows if row.type in required_types]
+        if not matching:
+            return None
+        return next((row for row in matching if row.is_default), matching[0])
+
     default = next((row for row in rows if row.is_default), None)
     return default or rows[0]
 
@@ -290,8 +308,32 @@ def _release_stripe_payout(db: Session, order: Order, seller: User, payout_metho
 def _release_paypal_payout(order: Order, payout_method: PayoutMethod, amount_minor: int) -> PayoutTransition:
     if not settings.paypal_payout_enabled:
         return _set_blocked(order, "PROVIDER_NOT_READY", "PayPal payouts are not configured on the platform")
+    if not payout_method.payouts_enabled:
+        return _set_blocked(order, "PAYPAL_PAYOUT_NOT_READY", "Seller does not have an enabled PayPal payout destination")
+    # New marketplace orders use PayPal's native delayed-disbursement rail. The
+    # capture ID is the reference PayPal releases; no second email payout is sent.
+    if getattr(order, "paypal_disbursement_mode", None) == "DELAYED":
+        if not order.psp_transaction_id or not payout_method.paypal_merchant_id:
+            return _set_blocked(
+                order,
+                "PAYPAL_DELAYED_DISBURSEMENT_NOT_READY",
+                "PayPal delayed-disbursement references are missing",
+            )
+        try:
+            payload = paypal_partner_service.create_referenced_payout(order.psp_transaction_id)
+        except Exception as exc:
+            return _set_failed(order, "PAYPAL_REFERENCED_PAYOUT_FAILED", str(exc))
+        reference = (
+            payload.get("payout_item_id")
+            or payload.get("transaction_id")
+            or payload.get("id")
+            or order.psp_transaction_id
+        )
+        return _set_released(order, "paypal", payout_method, reference)
+
+    # Legacy compatibility for orders captured before native delayed disbursement.
     receiver = (payout_method.account_ref or "").strip().lower()
-    if not payout_method.payouts_enabled or not receiver:
+    if not receiver:
         return _set_blocked(order, "PAYPAL_PAYOUT_NOT_READY", "Seller does not have an enabled PayPal payout destination")
     try:
         payload = paypal_payout_service.create_payout(
@@ -374,8 +416,15 @@ def release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
     if not seller:
         return _set_blocked(order, "SELLER_NOT_FOUND", "Seller account was not found")
 
-    payout_method = _preferred_release_method(db, order.seller_id)
+    payout_method = _preferred_release_method(db, order.seller_id, order.psp)
     if not payout_method:
+        provider = (order.psp or "").strip().lower()
+        if provider:
+            return _set_blocked(
+                order,
+                "PAYOUT_METHOD_MISSING",
+                f"Seller has not configured a payout destination for {provider}",
+            )
         return _set_blocked(order, "PAYOUT_METHOD_MISSING", "Seller has not configured any payout destination")
 
     amount_minor = amount_to_minor(order.amount or 0.0)

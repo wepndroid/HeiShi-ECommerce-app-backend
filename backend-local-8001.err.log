@@ -1,9 +1,6 @@
-INFO:     Started server process [36716]
+INFO:     Started server process [30780]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
-(trapped) error reading bcrypt version
-Traceback (most recent call last):
-  File "D:\TASK\HeiShi\Project\HeyMarketApp_local\Backend\.venv\lib\site-packages\passlib\handlers\bcrypt.py", line 620, in _load_backend_mixin
-    version = _bcrypt.__about__.__version__
-AttributeError: module 'bcrypt' has no attribute '__about__'
+ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 8001): only one usage of each socket address (protocol/network address/port) is normally permitted
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.

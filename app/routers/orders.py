@@ -19,7 +19,6 @@ from app.catalog_helpers import (
     find_bundle_item,
     listing_checkout_amount,
     release_order_bundle_hold,
-    set_bundle_item_status,
 )
 from app.config import settings
 from app.coupon_service import refresh_expired_coupons
@@ -45,6 +44,7 @@ from app.serializers import iso, order_to_dto
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 OPEN_ORDER_STATUSES = ("pendingPay", "pendingShip", "pendingService", "pendingReceive", "pendingReview")
+INVENTORY_OWNING_ORDER_STATUSES = ("pendingShip", "pendingService", "pendingReceive", "pendingReview")
 
 
 def _set_display_amount_cny(order: Order) -> None:
@@ -149,7 +149,7 @@ def _conflicting_open_order(
 ) -> Order | None:
     open_orders = (
         db.query(Order)
-        .filter(Order.listing_id == listing_id, Order.status.in_(OPEN_ORDER_STATUSES))
+        .filter(Order.listing_id == listing_id, Order.status.in_(INVENTORY_OWNING_ORDER_STATUSES))
         .all()
     )
     for order in open_orders:
@@ -327,7 +327,6 @@ def create_order(
                 detail={"code": "INVALID_STATE", "message": "Bundle item has no separate price", "details": {}},
             )
         bundle_item_id = body.bundleItemId
-        set_bundle_item_status(listing, bundle_item_id, "onHold")
     else:
         if listing.type == "bundle" and _bundle_has_on_hold_items(listing):
             raise HTTPException(

@@ -208,6 +208,8 @@ class Order(Base):
     payment_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
     psp_payment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     psp_transaction_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    paypal_payee_merchant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    paypal_disbursement_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     charge_currency: Mapped[str] = mapped_column(String(3), default="aud")
     amount_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
     display_amount_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -355,6 +357,10 @@ class PayoutMethod(Base):
     # account's status once onboarding (details_submitted + payouts_enabled) completes.
     stripe_external_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     payouts_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    paypal_merchant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    paypal_tracking_id: Mapped[str | None] = mapped_column(String(127), nullable=True, unique=True)
+    paypal_permissions_granted: Mapped[bool] = mapped_column(Boolean, default=False)
+    paypal_email_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class UserSettings(Base):

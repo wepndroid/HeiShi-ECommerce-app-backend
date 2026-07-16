@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     connect_refresh_url: str = "heishi://payout/connect/refresh"
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
+    # PayPal Commerce Platform attribution code shown on the Platform app page.
+    paypal_partner_attribution_id: str = ""
+    # Optional platform PayPal Merchant ID. Seller onboarding can complete without it;
+    # when configured it enables PayPal's merchant-integration capability verification.
+    paypal_partner_merchant_id: str = ""
+    # PayPal assigns this after registering the public webhook URL. Incoming
+    # webhook events are rejected unless their signature validates against it.
+    paypal_webhook_id: str = ""
     # PayPal environment is independent from Stripe simulation. This allows Stripe
     # test-mode API calls and PayPal sandbox API calls in the same escrow test stack.
     paypal_sandbox: bool = True

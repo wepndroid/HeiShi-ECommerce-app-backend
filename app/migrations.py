@@ -194,8 +194,14 @@ def run_migrations(engine: Engine) -> None:
         ("account_ref", "account_ref VARCHAR(255)"),
         ("stripe_external_account_id", "stripe_external_account_id VARCHAR(100)"),
         ("payouts_enabled", "payouts_enabled BOOLEAN DEFAULT 0"),
+        ("paypal_merchant_id", "paypal_merchant_id VARCHAR(32)"),
+        ("paypal_tracking_id", "paypal_tracking_id VARCHAR(127)"),
+        ("paypal_permissions_granted", "paypal_permissions_granted BOOLEAN DEFAULT 0"),
+        ("paypal_email_confirmed", "paypal_email_confirmed BOOLEAN DEFAULT 0"),
     ):
         _sqlite_add_column_if_missing(engine, "payout_methods", col, ddl)
+    _sqlite_add_column_if_missing(engine, "orders", "paypal_payee_merchant_id", "paypal_payee_merchant_id VARCHAR(32)")
+    _sqlite_add_column_if_missing(engine, "orders", "paypal_disbursement_mode", "paypal_disbursement_mode VARCHAR(20)")
 
     with engine.begin() as conn:
         conn.execute(

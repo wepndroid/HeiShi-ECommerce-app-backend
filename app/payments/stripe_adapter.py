@@ -22,6 +22,8 @@ class StripeAdapter:
         customer_id: str | None = None,
         payment_method_id: str | None = None,
         native_payment_sheet: bool = False,
+        payee_merchant_id: str | None = None,
+        platform_fee_minor: int = 0,
     ) -> CheckoutResult:
         secret = settings.stripe_secret_key.strip()
         if not secret:

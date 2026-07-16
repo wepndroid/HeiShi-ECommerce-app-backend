@@ -27,7 +27,19 @@ def _now() -> datetime:
 
 def _set_refunded(order: Order, reference: str | None = None) -> RefundTransition:
     order.payment_status = "refunded"
-    order.updated_at = _now()
+    now = _now()
+    # A successful provider refund permanently closes any seller payout that has
+    # not already been released. Keep this transition in the shared refund
+    # helper so admin disputes and any future refund entry point cannot leave a
+    # misleading `pending` payout behind.
+    if order.payout_status != "released":
+        order.payout_status = "reversed"
+        order.payout_reversed_at = order.payout_reversed_at or now
+        order.payout_reversal_reference = order.payout_reversal_reference or reference
+        order.payout_failure_code = None
+        order.payout_failure_reason = None
+        order.payout_failed_at = None
+    order.updated_at = now
     return RefundTransition(status="refunded", changed=True, reference=reference)
 
 
@@ -71,6 +83,7 @@ def refund_order_payment(order: Order) -> RefundTransition:
                 amount_minor=total_minor,
                 currency=order.charge_currency or "AUD",
                 note=f"Refund for order #{order.id}",
+                payee_merchant_id=getattr(order, "paypal_payee_merchant_id", None),
             )
         except Exception as exc:
             return _set_failed("PAYPAL_REFUND_FAILED", str(exc))

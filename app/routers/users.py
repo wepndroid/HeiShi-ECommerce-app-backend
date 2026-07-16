@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import re
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
@@ -13,6 +14,7 @@ from app.catalog_helpers import apply_public_listing_visibility_filter, get_or_c
 from app.database import get_db
 from app.models import Address, DevicePushToken, Follow, Listing, Order, PaymentMethod, PayoutMethod, Review, User, UserSettings, VerificationSubmission, ViewHistory
 from app.config import settings
+from app import paypal_partner_service
 from app.schemas import (
     AddPaymentMethodRequest,
     AddPayoutMethodRequest,
@@ -875,6 +877,15 @@ def add_payout_method(body: AddPayoutMethodRequest, user: User = Depends(get_cur
                 "details": {},
             },
         )
+    if body.type == "paypal":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "USE_PAYPAL_ONBOARDING",
+                "message": "PayPal payouts must be connected through PayPal seller onboarding",
+                "details": {},
+            },
+        )
     if body.type == "alipay" and not user.alipay_bound:
         raise HTTPException(
             status_code=409,
@@ -1019,6 +1030,116 @@ def create_payout_onboarding_link(user: User = Depends(get_current_user), db: Se
         db.commit()
     url = stripe_service.create_account_onboarding_link(account_id)
     return ConnectOnboardingResponse(url=url, simulated=False)
+
+
+@payouts_router.post("/paypal/link", response_model=ConnectOnboardingResponse)
+def create_paypal_seller_onboarding_link(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a one-use PayPal Partner Referral link for this seller."""
+    if not settings.paypal_payout_enabled or not settings.paypal_partner_attribution_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PAYOUT_PROVIDER_NOT_READY",
+                "message": "PayPal seller onboarding is not configured on the platform",
+                "details": {},
+            },
+        )
+    tracking_id = secrets.token_urlsafe(32)
+    method = (
+        db.query(PayoutMethod)
+        .filter(PayoutMethod.user_id == user.id, PayoutMethod.type == "paypal")
+        .first()
+    )
+    if not method:
+        count = db.query(PayoutMethod).filter(PayoutMethod.user_id == user.id).count()
+        method = PayoutMethod(
+            user_id=user.id,
+            type="paypal",
+            label="PayPal",
+            is_default=count == 0,
+        )
+        db.add(method)
+    method.paypal_tracking_id = tracking_id
+    method.paypal_permissions_granted = False
+    method.paypal_email_confirmed = False
+    method.payouts_enabled = False
+    db.commit()
+
+    return_url = (
+        f"{settings.base_url.rstrip('/')}/v1/payouts/paypal/return"
+        f"?trackingId={tracking_id}"
+    )
+    try:
+        payload = paypal_partner_service.create_seller_referral(
+            tracking_id=tracking_id,
+            return_url=return_url,
+        )
+        url = paypal_partner_service.referral_action_url(payload)
+    except paypal_partner_service.PayPalPartnerError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "PAYMENT_PROVIDER_ERROR", "message": str(exc), "details": {}},
+        ) from exc
+    return ConnectOnboardingResponse(url=url, simulated=False)
+
+
+def _paypal_true(value: str | None) -> bool:
+    return (value or "").strip().lower() == "true"
+
+
+@payouts_router.get("/paypal/return", include_in_schema=False)
+def paypal_seller_onboarding_return(
+    trackingId: str,
+    merchantId: str | None = None,
+    merchantIdInPayPal: str | None = None,
+    permissionsGranted: str | None = None,
+    consentStatus: str | None = None,
+    isEmailConfirmed: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Persist PayPal's seller identity; no seller ID is ever entered manually."""
+    tracking_id = merchantId or trackingId
+    method = (
+        db.query(PayoutMethod)
+        .filter(PayoutMethod.type == "paypal", PayoutMethod.paypal_tracking_id == tracking_id)
+        .first()
+    )
+    if not method or not merchantIdInPayPal:
+        return RedirectResponse("heishi:///settings/payout?paypalConnect=error", status_code=302)
+
+    permissions = _paypal_true(permissionsGranted)
+    consent = _paypal_true(consentStatus)
+    email_confirmed = _paypal_true(isEmailConfirmed)
+    method.paypal_merchant_id = merchantIdInPayPal.strip()
+    method.account_ref = merchantIdInPayPal.strip()
+    method.paypal_permissions_granted = permissions and consent
+    method.paypal_email_confirmed = email_confirmed
+    method.payouts_enabled = permissions and consent and email_confirmed
+    db.commit()
+    result = "return" if method.payouts_enabled else "pending"
+    return RedirectResponse(f"heishi:///settings/payout?paypalConnect={result}", status_code=302)
+
+
+@payouts_router.get("/paypal/status", response_model=ConnectStatusResponse)
+def get_paypal_seller_onboarding_status(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    method = (
+        db.query(PayoutMethod)
+        .filter(PayoutMethod.user_id == user.id, PayoutMethod.type == "paypal")
+        .first()
+    )
+    if not method:
+        return ConnectStatusResponse(connected=False, detailsSubmitted=False, payoutsEnabled=False)
+    return ConnectStatusResponse(
+        connected=bool(method.paypal_merchant_id),
+        detailsSubmitted=bool(method.paypal_permissions_granted),
+        payoutsEnabled=bool(method.payouts_enabled),
+    )
 
 
 @payouts_router.get("/connect/return", include_in_schema=False)
