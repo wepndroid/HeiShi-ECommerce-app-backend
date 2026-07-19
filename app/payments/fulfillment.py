@@ -12,6 +12,7 @@ from app.catalog_helpers import (
     listing_checkout_amount,
 )
 from app.models import Listing, Order, User
+from app.notification_jobs import enqueue_notification
 from app.order_jobs import schedule_auto_confirm
 from app.platform_config import escrow_fee_from_db
 from app.push_notifications import send_order_paid_push
@@ -63,6 +64,39 @@ def fulfill_paid_order(db: Session, order: Order) -> Order:
         order.status = "pendingShip"
     order.payment_status = "succeeded"
     order.updated_at = datetime.now(timezone.utc)
+    title = listing.title if listing else f"Order #{order.id}"
+    enqueue_notification(
+        db,
+        user_id=order.buyer_id,
+        role="buyer",
+        category="payment_update",
+        notification_type="order_payment_succeeded",
+        title="Payment successful",
+        body=f"Payment for order #{order.id} was successful.",
+        title_zh="付款成功",
+        body_zh=f"订单 #{order.id} 付款成功。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:payment:succeeded:buyer",
+        mandatory=True,
+    )
+    enqueue_notification(
+        db,
+        user_id=order.seller_id,
+        role="seller",
+        category="payment_update",
+        notification_type="buyer_payment_succeeded",
+        title="Buyer payment received",
+        body=f"Order #{order.id} for {title[:120]} is paid and ready for fulfillment.",
+        title_zh="买家付款成功",
+        body_zh=f"订单 #{order.id} 已付款，请安排交付。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:payment:succeeded:seller",
+        mandatory=True,
+    )
     db.commit()
     db.refresh(order)
     return order

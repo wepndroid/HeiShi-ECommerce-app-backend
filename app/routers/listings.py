@@ -1,3 +1,5 @@
+import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +15,8 @@ from app.catalog_helpers import compute_purchase_available, reset_bundle_meta_fo
 from app.config import settings
 from app.database import get_db
 from app.messaging_read import bump_unread_for_recipient
-from app.models import Conversation, Favorite, Listing, Message, Order, User, ViewHistory
+from app.models import Conversation, Favorite, Listing, MediaAsset, Message, Order, User, ViewHistory
+from app.media_processing import MediaValidationError, process_image_variants
 from app.moderation import find_blocked_keyword
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
@@ -747,13 +750,78 @@ def create_resale(
 async def upload_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     content = await file.read()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "File too large (max 10MB)", "details": {}})
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail={"code": "VALIDATION_ERROR", "message": "File too large (max 20MB)", "details": {}})
     resolved_type = _resolve_upload_content_type(file, content)
     if not resolved_type:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "Invalid file type", "details": {}})
-    ext = _ext_for_upload_type(resolved_type, file.filename)
-    url, key = upload_image_bytes(content, resolved_type, ext, user_id=user.id)
-    return UploadImageResponse(url=url, key=key)
+    checksum = hashlib.sha256(content).hexdigest()
+    existing = (
+        db.query(MediaAsset)
+        .filter(
+            MediaAsset.owner_id == user.id,
+            MediaAsset.checksum_sha256 == checksum,
+            MediaAsset.status == "READY",
+        )
+        .first()
+    )
+    if existing and existing.original_url:
+        variants = json.loads(existing.variants_json or "{}")
+        return UploadImageResponse(
+            url=variants.get("preview") or existing.original_url,
+            key=existing.storage_key,
+            mediaAssetId=existing.id,
+            thumbnailUrl=existing.thumbnail_url,
+            variants=variants,
+        )
+    try:
+        processed = process_image_variants(content)
+    except MediaValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": str(exc), "details": {}},
+        ) from exc
+    original_url, original_key = upload_image_bytes(
+        processed.original,
+        processed.original_content_type,
+        processed.original_extension,
+        user_id=user.id,
+    )
+    variant_urls: dict[str, str] = {}
+    for name, (variant_bytes, variant_type, variant_ext, _width, _height) in processed.variants.items():
+        variant_url, _variant_key = upload_image_bytes(
+            variant_bytes,
+            variant_type,
+            variant_ext,
+            user_id=user.id,
+        )
+        variant_urls[name] = variant_url
+    asset = MediaAsset(
+        owner_id=user.id,
+        media_type="image",
+        status="READY",
+        original_filename=file.filename,
+        content_type=processed.original_content_type,
+        file_size=len(content),
+        checksum_sha256=checksum,
+        storage_key=original_key,
+        original_url=original_url,
+        thumbnail_url=variant_urls["thumbnail"],
+        variants_json=json.dumps(variant_urls),
+        width=processed.width,
+        height=processed.height,
+        moderation_status="pending",
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return UploadImageResponse(
+        url=variant_urls["preview"],
+        key=original_key,
+        mediaAssetId=asset.id,
+        thumbnailUrl=asset.thumbnail_url,
+        variants=variant_urls,
+    )

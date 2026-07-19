@@ -43,11 +43,33 @@ class SendRegisterCodeResponse(BaseModel):
 class LoginRequest(BaseModel):
     phone: str
     password: str
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
 
 
 class LoginOtpRequest(BaseModel):
     phone: str
     verificationCode: str
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
+
+
+class BindPhoneRequest(BaseModel):
+    phone: str
+
+
+class VerifyBindPhoneRequest(BaseModel):
+    phone: str
+    verificationCode: str = Field(min_length=6, max_length=6)
+
+
+class MergePhoneAccountRequest(BaseModel):
+    """Authorize an account merge by proving the password of the phone account."""
+
+    phone: str
+    password: str = Field(min_length=6, max_length=200)
 
 
 class SyncProfileRequest(BaseModel):
@@ -229,6 +251,9 @@ class ImageSearchResponseDto(BaseModel):
 class UploadImageResponse(BaseModel):
     url: str
     key: str
+    mediaAssetId: str | None = None
+    thumbnailUrl: str | None = None
+    variants: dict[str, str] | None = None
 
 
 # Orders
@@ -376,8 +401,10 @@ class ChatMessageDto(BaseModel):
     text: str
     sentAt: str
     ackRead: bool = False
-    kind: Literal["text", "priceChange"] = "text"
+    kind: Literal["text", "priceChange", "privateOffer"] = "text"
     price: float | None = None
+    structuredPayload: dict | None = None
+    officialPlatformMessage: bool = False
 
 
 class OpenConversationRequest(BaseModel):

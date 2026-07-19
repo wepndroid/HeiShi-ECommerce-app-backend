@@ -25,6 +25,7 @@ from app.coupon_service import refresh_expired_coupons
 from app.database import SessionLocal, get_db
 from app.models import Coupon, Listing, Order, Review, User
 from app.order_jobs import schedule_auto_confirm
+from app.notification_jobs import enqueue_notification
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
@@ -500,6 +501,22 @@ def ship_order(order_id: int, request: Request, user: User = Depends(get_current
     order.status = "pendingReceive"
     schedule_auto_confirm(order)
     order.updated_at = datetime.now(timezone.utc)
+    enqueue_notification(
+        db,
+        user_id=order.buyer_id,
+        role="buyer",
+        category="delivery_update",
+        notification_type="seller_shipped_order",
+        title="Seller confirmed shipment",
+        body=f"Order #{order.id} is on its way.",
+        title_zh="卖家已发货",
+        body_zh=f"订单 #{order.id} 已发货。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:shipped",
+        mandatory=True,
+    )
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request), include_buyer=True)
@@ -518,6 +535,22 @@ def complete_service_order(
     order.status = "pendingReceive"
     schedule_auto_confirm(order)
     order.updated_at = datetime.now(timezone.utc)
+    enqueue_notification(
+        db,
+        user_id=order.buyer_id,
+        role="buyer",
+        category="delivery_update",
+        notification_type="seller_completed_service",
+        title="Service marked complete",
+        body=f"Please review and confirm order #{order.id}.",
+        title_zh="卖家已完成服务",
+        body_zh=f"请检查并确认订单 #{order.id}。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:service-complete",
+        mandatory=True,
+    )
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request), include_buyer=True)
@@ -608,6 +641,22 @@ def confirm_receive(order_id: int, request: Request, user: User = Depends(get_cu
     order.confirmed_at = datetime.now(timezone.utc)
     order.auto_confirm_at = None
     order.updated_at = datetime.now(timezone.utc)
+    enqueue_notification(
+        db,
+        user_id=order.seller_id,
+        role="seller",
+        category="payout",
+        notification_type="buyer_confirmed_receipt",
+        title="Buyer confirmed receipt",
+        body=f"Order #{order.id} was confirmed and seller settlement was initiated.",
+        title_zh="买家已确认收货",
+        body_zh=f"订单 #{order.id} 已确认，卖家结算已开始。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:receipt-confirmed:seller",
+        mandatory=True,
+    )
     db.commit()
     db.refresh(order)
     return order_to_dto(order, get_accept_language(request))
@@ -647,6 +696,22 @@ def request_refund(
             detail={"code": "INVALID_STATE", "message": "Refund cannot be requested for this order", "details": {}},
         )
     _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
+    enqueue_notification(
+        db,
+        user_id=order.seller_id,
+        role="seller",
+        category="refund_update",
+        notification_type="buyer_requested_refund",
+        title="Buyer requested a refund",
+        body=f"Order #{order.id} is awaiting dispute review.",
+        title_zh="买家申请退款",
+        body_zh=f"订单 #{order.id} 正在等待平台审核。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:refund-requested:seller",
+        mandatory=True,
+    )
     notify_admin(
         db,
         event_type="refund_requested",
@@ -681,6 +746,22 @@ def open_dispute(
             detail={"code": "INVALID_STATE", "message": "Order cannot enter dispute in current state", "details": {}},
         )
     _open_refund_style_dispute(order, reason=body.reason, evidence_urls=body.evidenceUrls)
+    enqueue_notification(
+        db,
+        user_id=order.seller_id,
+        role="seller",
+        category="dispute",
+        notification_type="buyer_opened_dispute",
+        title="Buyer opened a dispute",
+        body=f"Order #{order.id} requires your attention.",
+        title_zh="买家发起争议",
+        body_zh=f"订单 #{order.id} 需要您的处理。",
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:dispute-opened:seller",
+        mandatory=True,
+    )
     notify_admin(
         db,
         event_type="dispute_opened",

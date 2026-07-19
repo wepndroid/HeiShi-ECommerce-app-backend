@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Order
+from app.notification_jobs import enqueue_notification
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
 from app.payments.refunds import apply_stripe_refund_update
 
@@ -88,6 +89,35 @@ def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) ->
                 order.status = "inDispute"
                 order.dispute_status = "refund_failed"
                 order.payout_paused = True
+            refund_state = transition.status
+            enqueue_notification(
+                db,
+                user_id=order.buyer_id,
+                role="buyer",
+                category="refund_update",
+                notification_type=f"refund_{refund_state}",
+                title={
+                    "refunded": "Refund completed",
+                    "pending": "Refund processing",
+                }.get(refund_state, "Refund needs attention"),
+                body={
+                    "refunded": f"Your refund for order #{order.id} is complete.",
+                    "pending": f"Your refund for order #{order.id} is still processing.",
+                }.get(refund_state, f"The refund for order #{order.id} could not be completed."),
+                title_zh={
+                    "refunded": "退款已完成",
+                    "pending": "退款处理中",
+                }.get(refund_state, "退款处理异常"),
+                body_zh={
+                    "refunded": f"订单 #{order.id} 的退款已完成。",
+                    "pending": f"订单 #{order.id} 的退款仍在处理中。",
+                }.get(refund_state, f"订单 #{order.id} 的退款未能完成。"),
+                business_type="order",
+                business_id=str(order.id),
+                deep_link=f"heymarket://order/{order.id}",
+                deduplication_key=f"order:{order.id}:refund:{refund_state}:buyer",
+                mandatory=True,
+            )
             db.commit()
         return True
     if event_type in ("payment_intent.succeeded", "checkout.session.completed"):

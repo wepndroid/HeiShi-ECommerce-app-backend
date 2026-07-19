@@ -146,6 +146,32 @@ def run_migrations(engine: Engine) -> None:
     _sqlite_add_column_if_missing(engine, "system_notifications", "body_zh", "body_zh TEXT")
     _sqlite_add_column_if_missing(engine, "system_notifications", "action_type", "action_type VARCHAR(30)")
     _sqlite_add_column_if_missing(engine, "system_notifications", "action_ref", "action_ref VARCHAR(50)")
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "user_role_context", "user_role_context VARCHAR(20)"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "notification_type", "notification_type VARCHAR(50)"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "business_type", "business_type VARCHAR(30)"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "business_id", "business_id VARCHAR(50)"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "deep_link", "deep_link VARCHAR(500)"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "system_notifications", "push_status", "push_status VARCHAR(20) DEFAULT 'pending'"
+    )
+    _sqlite_add_column_if_missing(engine, "system_notifications", "read_at", "read_at DATETIME")
+    _sqlite_add_column_if_missing(engine, "messages", "message_type", "message_type VARCHAR(30) DEFAULT 'text'")
+    _sqlite_add_column_if_missing(
+        engine, "messages", "structured_payload_json", "structured_payload_json TEXT DEFAULT '{}'"
+    )
+    _sqlite_add_column_if_missing(
+        engine, "messages", "official_platform_message", "official_platform_message BOOLEAN DEFAULT 0"
+    )
     _sqlite_add_column_if_missing(engine, "listings", "bundle_meta_json", "bundle_meta_json TEXT DEFAULT '{}'")
 
     _sqlite_add_column_if_missing(
@@ -214,6 +240,19 @@ def run_migrations(engine: Engine) -> None:
     _sqlite_migrate_mvp_admin(engine)
     _sqlite_migrate_mvp_admin_v2(engine)
     _sqlite_migrate_escrow_fee_defaults(engine)
+    if "notification_dispatches" in set(inspect(engine).get_table_names()):
+        _sqlite_add_column_if_missing(
+            engine,
+            "notification_dispatches",
+            "attempt_count",
+            "attempt_count INTEGER DEFAULT 0",
+        )
+        _sqlite_add_column_if_missing(
+            engine,
+            "notification_dispatches",
+            "last_attempt_at",
+            "last_attempt_at DATETIME",
+        )
 
 
 def _sqlite_migrate_escrow_fee_defaults(engine: Engine) -> None:

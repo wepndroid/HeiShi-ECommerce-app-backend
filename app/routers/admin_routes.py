@@ -48,6 +48,7 @@ from app.models import (
     ViewHistory,
 )
 from app.media_urls import normalize_media_urls
+from app.notification_jobs import enqueue_notification
 from app.payments.refunds import refund_order_payment
 from app.payout_release import release_payout_for_order, reverse_released_payout_for_order
 from app.serializers import user_to_dto, _user_avatar_url
@@ -819,6 +820,22 @@ def approve_content(listing_id: int, db: Session = Depends(get_db), admin: User 
     listing.reviewed_by = admin.id
     if listing.status == "draft":
         listing.status = "active"
+    enqueue_notification(
+        db,
+        user_id=listing.seller_id,
+        role="seller",
+        category="moderation",
+        notification_type="listing_review_approved",
+        title="Listing approved",
+        body=f"Your listing “{listing.title[:140]}” is now visible.",
+        title_zh="商品审核通过",
+        body_zh=f"您的商品“{(listing.title_zh or listing.title)[:140]}”已上线。",
+        business_type="listing",
+        business_id=str(listing.id),
+        deep_link=f"heymarket://listing/{listing.id}",
+        deduplication_key=f"listing:{listing.id}:review:approved:{listing.reviewed_at.isoformat()}",
+        mandatory=True,
+    )
     log_admin_action(db, admin_id=admin.id, action_type="approve_content", target_type="listing", target_id=listing_id)
     db.commit()
     return {"ok": True}
@@ -833,6 +850,22 @@ def reject_content(listing_id: int, body: RejectRequest, db: Session = Depends(g
     listing.review_note = body.reason
     listing.reviewed_at = datetime.now(timezone.utc)
     listing.reviewed_by = admin.id
+    enqueue_notification(
+        db,
+        user_id=listing.seller_id,
+        role="seller",
+        category="moderation",
+        notification_type="listing_review_rejected",
+        title="Listing needs changes",
+        body=body.reason[:500],
+        title_zh="商品审核未通过",
+        body_zh=body.reason[:500],
+        business_type="listing",
+        business_id=str(listing.id),
+        deep_link=f"heymarket://listing/{listing.id}",
+        deduplication_key=f"listing:{listing.id}:review:rejected:{listing.reviewed_at.isoformat()}",
+        mandatory=True,
+    )
     log_admin_action(db, admin_id=admin.id, action_type="reject_content", target_type="listing", target_id=listing_id, after={"reason": body.reason})
     db.commit()
     return {"ok": True}
@@ -1517,6 +1550,60 @@ def resolve_dispute(
                     },
                 },
             )
+    buyer_title = (
+        "Refund initiated"
+        if body.resolution == "refund" and order.status == "refundInProgress"
+        else "Dispute resolved"
+    )
+    buyer_body = (
+        f"The refund for order #{order.id} is being processed."
+        if body.resolution == "refund" and order.status == "refundInProgress"
+        else (
+            f"Order #{order.id} was resolved with a refund."
+            if body.resolution == "refund"
+            else f"Order #{order.id} was completed by the platform decision."
+        )
+    )
+    enqueue_notification(
+        db,
+        user_id=order.buyer_id,
+        role="buyer",
+        category="dispute",
+        notification_type=f"dispute_resolved_{body.resolution}",
+        title=buyer_title,
+        body=buyer_body,
+        title_zh="争议处理结果",
+        body_zh=buyer_body,
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:dispute:{body.resolution}:buyer",
+        mandatory=True,
+    )
+    enqueue_notification(
+        db,
+        user_id=order.seller_id,
+        role="seller",
+        category="dispute",
+        notification_type=f"dispute_resolved_{body.resolution}",
+        title="Dispute resolved",
+        body=(
+            f"Order #{order.id} was resolved with a buyer refund."
+            if body.resolution == "refund"
+            else f"Order #{order.id} was completed and seller payout was released."
+        ),
+        title_zh="争议处理结果",
+        body_zh=(
+            f"订单 #{order.id} 已退款给买家。"
+            if body.resolution == "refund"
+            else f"订单 #{order.id} 已完成，卖家款项已发放。"
+        ),
+        business_type="order",
+        business_id=str(order.id),
+        deep_link=f"heymarket://order/{order.id}",
+        deduplication_key=f"order:{order.id}:dispute:{body.resolution}:seller",
+        mandatory=True,
+    )
     order.updated_at = datetime.now(timezone.utc)
     log_admin_action(
         db,

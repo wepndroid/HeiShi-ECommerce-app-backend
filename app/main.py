@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
-from app.routers import auth, catalog, listings, messages, orders, region_safety, user_data, users
+from app.routers import auth, catalog, listings, messages, orders, platform_features, region_safety, user_data, users
 from app.routers import admin_routes
 from app.payments.router import router as payments_router
 from app.migrations import run_migrations
@@ -25,8 +25,10 @@ async def _auto_confirm_loop() -> None:
         db = SessionLocal()
         try:
             from app.order_jobs import process_auto_confirm_orders
+            from app.notification_jobs import process_scheduled_notifications
 
             process_auto_confirm_orders(db)
+            process_scheduled_notifications(db)
         finally:
             db.close()
 
@@ -40,8 +42,10 @@ async def lifespan(_app: FastAPI):
         backfill_read_watermarks(db)
         cleanup_duplicate_empty_conversations(db)
         from app.order_jobs import process_auto_confirm_orders
+        from app.notification_jobs import process_scheduled_notifications
 
         process_auto_confirm_orders(db)
+        process_scheduled_notifications(db)
         seed(db)
     finally:
         db.close()
@@ -98,20 +102,38 @@ app.include_router(users.settings_router, prefix=API_PREFIX)
 app.include_router(region_safety.router, prefix=API_PREFIX)
 app.include_router(payments_router, prefix=API_PREFIX)
 app.include_router(admin_routes.router, prefix=API_PREFIX)
+app.include_router(platform_features.router, prefix=API_PREFIX)
+app.include_router(platform_features.admin_router, prefix=API_PREFIX)
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException):
     if isinstance(exc.detail, dict) and "message" in exc.detail:
-        return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    return JSONResponse(status_code=exc.status_code, content={"code": "ERROR", "message": str(exc.detail), "details": {}})
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"success": False, **exc.detail},
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "code": "ERROR",
+            "message": str(exc.detail),
+            "details": {},
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content={"code": "VALIDATION_ERROR", "message": "Request validation failed", "details": exc.errors()},
+        content={
+            "success": False,
+            "code": "VALIDATION_ERROR",
+            "message": "Request validation failed",
+            "details": exc.errors(),
+        },
     )
 
 

@@ -20,6 +20,7 @@ from app.messaging_read import (
     set_marked_as_unread,
 )
 from app.models import Conversation, Listing, Message, Order, SystemNotification, User
+from app.notification_jobs import enqueue_notification
 from app.pagination import paginate
 from app.schemas import (
     ChatMessageDto,
@@ -269,10 +270,26 @@ def send_message(
     db.add(msg)
     db.flush()
     bump_unread_for_recipient(db, conv, user.id)
+    recipient_id = conv.seller_id if user.id == conv.buyer_id else conv.buyer_id
+    recipient_role = "seller" if recipient_id == conv.seller_id else "buyer"
+    enqueue_notification(
+        db,
+        user_id=recipient_id,
+        role=recipient_role,
+        category="chat_message",
+        notification_type="chat_message_received",
+        title=f"New message from {user.nickname}",
+        body=text[:500],
+        title_zh=f"来自 {user.nickname} 的新消息",
+        body_zh=text[:500],
+        business_type="conversation",
+        business_id=conv.id,
+        deep_link=f"heymarket://chat/{conv.id}",
+        deduplication_key=f"message:{msg.id}:recipient:{recipient_id}",
+    )
     db.commit()
     db.refresh(msg)
 
-    recipient_id = conv.seller_id if user.id == conv.buyer_id else conv.buyer_id
     background_tasks.add_task(
         _dispatch_chat_push,
         recipient_id,
@@ -400,7 +417,7 @@ def mark_group_read(
             SystemNotification.category == category,
             SystemNotification.unread.is_(True),
         )
-        .update({SystemNotification.unread: False})
+        .update({SystemNotification.unread: False, SystemNotification.read_at: datetime.now(timezone.utc)})
     )
     db.commit()
 

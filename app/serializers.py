@@ -386,6 +386,14 @@ def message_to_dto(msg: Message, conv: Conversation | None = None, viewer_id: st
             kind = "priceChange"
         except (TypeError, ValueError):
             price = None
+    structured_payload = None
+    if msg.message_type == "private_offer":
+        kind = "privateOffer"
+        try:
+            parsed = json.loads(msg.structured_payload_json or "{}")
+            structured_payload = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            structured_payload = None
     text = f"Price updated to A${price:.2f}" if price is not None else msg.text
     return ChatMessageDto(
         id=msg.id,
@@ -396,6 +404,8 @@ def message_to_dto(msg: Message, conv: Conversation | None = None, viewer_id: st
         ackRead=ack_read,
         kind=kind,
         price=price,
+        structuredPayload=structured_payload,
+        officialPlatformMessage=bool(msg.official_platform_message),
     )
 
 

@@ -1,8 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 import secrets
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,17 @@ from app.catalog_helpers import get_or_create_settings
 from app.config import settings
 from app.coupon_service import issue_welcome_coupon
 from app.database import get_db
-from app.models import PhoneOtp, User
+from app.models import (
+    AuthIdentity,
+    Conversation,
+    DeviceSession,
+    Listing,
+    LoginAuditLog,
+    Order,
+    PhoneOtp,
+    RefreshToken,
+    User,
+)
 from app.phone_verification import (
     OTP_TTL_SECONDS,
     RESEND_COOLDOWN_SECONDS,
@@ -32,8 +43,10 @@ from app.phone_verification import (
     consume_register_code,
     generate_code,
     issue_login_code,
+    issue_otp_code,
     issue_register_code,
     resend_allowed_at,
+    consume_otp_code,
 )
 from app.twilio_otp import TwilioOtpError, send_sms_verification, verify_sms_code
 from app.schemas import (
@@ -51,6 +64,9 @@ from app.schemas import (
     OAuthProvisionRequest,
     WeChatAuthRequest,
     ChangePasswordRequest,
+    BindPhoneRequest,
+    VerifyBindPhoneRequest,
+    MergePhoneAccountRequest,
 )
 from app.serializers import user_to_dto
 from app.supabase_auth import (
@@ -684,10 +700,96 @@ def _should_block_partial_twilio_config() -> bool:
     return settings.twilio_verify_partially_configured and not settings.sms_dev_otp
 
 
-def _issue_tokens(db: Session, user: User) -> AuthTokensDto:
+def _sync_auth_identities(db: Session, user: User) -> None:
+    """Backfill normalized identities while legacy columns remain compatible."""
+    candidates: list[tuple[str, str, bool, dict]] = []
+    if user.phone:
+        candidates.append(("phone", user.phone, bool(user.phone_verified), {}))
+    if user.wechat_unionid or user.wechat_openid:
+        candidates.append(
+            (
+                "wechat",
+                user.wechat_unionid or user.wechat_openid,
+                bool(user.wechat_bound),
+                {"openid": user.wechat_openid, "unionid": user.wechat_unionid},
+            )
+        )
+    if user.google_sub:
+        candidates.append(("google", user.google_sub, bool(user.email_verified), {"email": user.email}))
+    for provider, subject, verified, metadata in candidates:
+        existing = (
+            db.query(AuthIdentity)
+            .filter(
+                AuthIdentity.provider == provider,
+                AuthIdentity.provider_subject == subject,
+            )
+            .first()
+        )
+        if existing and existing.user_id != user.id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "IDENTITY_CONFLICT",
+                    "message": f"This {provider} identity is already bound to another account",
+                    "details": {},
+                },
+            )
+        if not existing:
+            db.add(
+                AuthIdentity(
+                    user_id=user.id,
+                    provider=provider,
+                    provider_subject=subject,
+                    verified=verified,
+                    metadata_json=json.dumps(metadata),
+                    last_used_at=datetime.now(timezone.utc),
+                )
+            )
+        else:
+            existing.verified = existing.verified or verified
+            existing.metadata_json = json.dumps(metadata)
+            existing.last_used_at = datetime.now(timezone.utc)
+
+
+def _issue_tokens(
+    db: Session,
+    user: User,
+    *,
+    request: Request | None = None,
+    device_id: str | None = None,
+    platform: str | None = None,
+    device_name: str | None = None,
+    suspicious: bool = False,
+) -> AuthTokensDto:
+    _sync_auth_identities(db, user)
     access = create_access_token(user.id)
     refresh = create_refresh_token()
-    store_refresh_token(db, user.id, refresh)
+    refresh_record = store_refresh_token(db, user.id, refresh)
+    db.add(
+        DeviceSession(
+            user_id=user.id,
+            refresh_token_id=refresh_record.id,
+            device_id=device_id or f"legacy-{secrets.token_urlsafe(18)}",
+            platform=(platform or "unknown").lower(),
+            device_name=device_name,
+            ip_address=request.client.host if request and request.client else None,
+            user_agent=request.headers.get("user-agent") if request else None,
+            suspicious=suspicious,
+        )
+    )
+    db.add(
+        LoginAuditLog(
+            user_id=user.id,
+            provider="session",
+            subject_hint=user.phone[-4:] if user.phone else user.heishi_id,
+            event_type="login_success",
+            success=True,
+            ip_address=request.client.host if request and request.client else None,
+            user_agent=request.headers.get("user-agent") if request else None,
+            device_id=device_id,
+        )
+    )
+    db.commit()
     return AuthTokensDto(
         accessToken=access,
         refreshToken=refresh,
@@ -825,15 +927,70 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=AuthTokensDto)
-def login(body: LoginRequest, db: Session = Depends(get_db)):
+def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
     phone = _require_valid_phone(body.phone)
     user = db.query(User).filter(User.phone == phone).first()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    recent_failures = (
+        db.query(LoginAuditLog)
+        .filter(
+            LoginAuditLog.subject_hint == phone,
+            LoginAuditLog.success.is_(False),
+            LoginAuditLog.created_at >= cutoff,
+        )
+        .count()
+    )
+    if recent_failures >= 5:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "LOGIN_RATE_LIMIT",
+                "message": "Too many failed login attempts. Try again later.",
+                "details": {"retryAfter": 900},
+            },
+        )
     if not user or not verify_password(body.password, user.password_hash):
+        db.add(
+            LoginAuditLog(
+                user_id=user.id if user else None,
+                provider="phone",
+                subject_hint=phone,
+                event_type="login_failure",
+                success=False,
+                failure_code="INVALID_CREDENTIALS",
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                device_id=body.deviceId,
+            )
+        )
+        db.commit()
         raise HTTPException(
             status_code=401,
             detail={"code": "INVALID_CREDENTIALS", "message": "Invalid phone or password", "details": {}},
         )
-    return _issue_tokens(db, user)
+    if user.account_status != "normal":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ACCOUNT_SUSPENDED", "message": "This account is suspended", "details": {}},
+        )
+    known_device = False
+    if body.deviceId:
+        known_device = (
+            db.query(DeviceSession)
+            .filter(DeviceSession.user_id == user.id, DeviceSession.device_id == body.deviceId)
+            .first()
+            is not None
+        )
+    suspicious = recent_failures >= 2 or (bool(body.deviceId) and not known_device and recent_failures > 0)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        suspicious=suspicious,
+    )
 
 
 def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
@@ -893,7 +1050,7 @@ def send_login_code(body: SendRegisterCodeRequest, db: Session = Depends(get_db)
 
 
 @router.post("/login/verify", response_model=AuthTokensDto)
-def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
+def login_verify(body: LoginOtpRequest, request: Request, db: Session = Depends(get_db)):
     phone = _require_valid_phone(body.phone)
     if _should_block_partial_twilio_config():
         raise HTTPException(
@@ -934,7 +1091,19 @@ def login_verify(body: LoginOtpRequest, db: Session = Depends(get_db)):
             status_code=404,
             detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
         )
-    return _issue_tokens(db, user)
+    if user.account_status != "normal":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ACCOUNT_SUSPENDED", "message": "This account is suspended", "details": {}},
+        )
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+    )
 
 
 @router.post("/change-password", status_code=204)
@@ -990,3 +1159,384 @@ def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     record_daily_active_user(db, user.id)
     return user_to_dto(user)
+
+
+@router.get("/identities")
+def list_auth_identities(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _sync_auth_identities(db, user)
+    db.commit()
+    rows = (
+        db.query(AuthIdentity)
+        .filter(AuthIdentity.user_id == user.id)
+        .order_by(AuthIdentity.bound_at.asc())
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "provider": row.provider,
+            "verified": row.verified,
+            "boundAt": row.bound_at.isoformat(),
+            "lastUsedAt": row.last_used_at.isoformat() if row.last_used_at else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/identities/phone/send-code", response_model=SendRegisterCodeResponse)
+def send_bind_phone_code(
+    body: BindPhoneRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    phone = _require_valid_phone(body.phone)
+    existing = (
+        db.query(PhoneOtp)
+        .filter(
+            PhoneOtp.phone == phone,
+            PhoneOtp.purpose == "bind_phone",
+            PhoneOtp.consumed.is_(False),
+        )
+        .first()
+    )
+    if existing is not None:
+        allowed_at = resend_allowed_at(existing)
+        now = datetime.now(timezone.utc)
+        if now < allowed_at:
+            wait = max(1, int((allowed_at - now).total_seconds()))
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "OTP_RATE_LIMIT",
+                    "message": f"Please wait {wait}s before requesting another code",
+                    "details": {"retryAfter": wait},
+                },
+            )
+    if _should_block_partial_twilio_config():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "TWILIO_NOT_CONFIGURED",
+                "message": "Twilio Verify env vars must all be set together",
+                "details": {},
+            },
+        )
+    if _should_use_twilio_verify():
+        try:
+            send_sms_verification(phone)
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+        return SendRegisterCodeResponse(
+            expiresIn=OTP_TTL_SECONDS,
+            resendAfter=RESEND_COOLDOWN_SECONDS,
+        )
+    code = generate_code()
+    issue_otp_code(db, phone, "bind_phone", code)
+    print(f"[HeyMarket OTP] bind_phone {phone} -> {code}")
+    return SendRegisterCodeResponse(
+        expiresIn=OTP_TTL_SECONDS,
+        resendAfter=RESEND_COOLDOWN_SECONDS,
+        devCode=code if settings.expose_dev_otp else None,
+    )
+
+
+@router.post("/identities/phone/verify")
+def verify_and_bind_phone(
+    body: VerifyBindPhoneRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    phone = _require_valid_phone(body.phone)
+    if _should_use_twilio_verify():
+        try:
+            verify_sms_code(phone, body.verificationCode)
+        except TwilioOtpError as exc:
+            raise _twilio_http_error(exc) from exc
+    else:
+        try:
+            consume_otp_code(db, phone, "bind_phone", body.verificationCode)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": str(exc),
+                    "message": "Invalid or expired verification code",
+                    "details": {},
+                },
+            ) from exc
+    owner = db.query(User).filter(User.phone == phone, User.id != user.id).first()
+    if owner:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACCOUNT_MERGE_REQUIRED",
+                "message": "This phone belongs to another account. Authorize an account merge to continue.",
+                "details": {"provider": "phone"},
+            },
+        )
+    existing_phone_identity = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.user_id == user.id,
+            AuthIdentity.provider == "phone",
+        )
+        .first()
+    )
+    if existing_phone_identity and existing_phone_identity.provider_subject != phone:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROVIDER_ALREADY_BOUND",
+                "message": "A phone number is already bound to this account",
+                "details": {},
+            },
+        )
+    user.phone = phone
+    user.phone_verified = True
+    _sync_auth_identities(db, user)
+    db.commit()
+    return {"bound": True, "provider": "phone"}
+
+
+@router.post("/identities/wechat/bind")
+def bind_wechat_identity(
+    body: WeChatAuthRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = _wechat_exchange_code(body.code)
+    openid = str(profile["openid"])
+    unionid = str(profile.get("unionid") or "") or None
+    subject = unionid or openid
+    existing = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == "wechat",
+            AuthIdentity.provider_subject == subject,
+        )
+        .first()
+    )
+    legacy_owner = _find_wechat_user(db, openid, unionid)
+    owner_id = existing.user_id if existing else legacy_owner.id if legacy_owner else None
+    if owner_id and owner_id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACCOUNT_MERGE_REQUIRED",
+                "message": "This WeChat identity belongs to another account",
+                "details": {"provider": "wechat"},
+            },
+        )
+    user.wechat_openid = openid
+    user.wechat_unionid = unionid
+    user.wechat_bound = True
+    _sync_auth_identities(db, user)
+    db.commit()
+    return {"bound": True, "provider": "wechat"}
+
+
+@router.post("/identities/google/bind")
+def bind_google_identity(
+    body: GoogleAuthRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = _google_exchange_id_token(body.idToken)
+    subject = str(profile["sub"])
+    existing = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == "google",
+            AuthIdentity.provider_subject == subject,
+        )
+        .first()
+    )
+    legacy_owner = db.query(User).filter(User.google_sub == subject).first()
+    owner_id = existing.user_id if existing else legacy_owner.id if legacy_owner else None
+    if owner_id and owner_id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACCOUNT_MERGE_REQUIRED",
+                "message": "This Google identity belongs to another account",
+                "details": {"provider": "google"},
+            },
+        )
+    _apply_google_profile_to_user(user, profile)
+    _sync_auth_identities(db, user)
+    db.commit()
+    return {"bound": True, "provider": "google"}
+
+
+@router.post("/account-merge/phone", response_model=AuthTokensDto)
+def merge_phone_account(
+    body: MergePhoneAccountRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Merge an empty duplicate phone account after password proof.
+
+    Accounts with marketplace history require an administrator-assisted merge so
+    ownership, settlement, audit, and dispute records are never silently rewritten.
+    """
+    phone = _require_valid_phone(body.phone)
+    target = db.query(User).filter(User.phone == phone).first()
+    if not target or not verify_password(body.password, target.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "MERGE_AUTHORIZATION_FAILED",
+                "message": "The phone account credentials could not be verified",
+                "details": {},
+            },
+        )
+    if target.id == user.id:
+        return _issue_tokens(db, user, request=request)
+    if target.is_admin or user.is_admin:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_NOT_ALLOWED",
+                "message": "Administrator accounts cannot be merged",
+                "details": {},
+            },
+        )
+    has_marketplace_history = any(
+        (
+            db.query(Listing.id).filter(Listing.seller_id == target.id).first(),
+            db.query(Order.id)
+            .filter((Order.buyer_id == target.id) | (Order.seller_id == target.id))
+            .first(),
+            db.query(Conversation.id)
+            .filter(
+                (Conversation.buyer_id == target.id)
+                | (Conversation.seller_id == target.id)
+            )
+            .first(),
+        )
+    )
+    if has_marketplace_history:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_REQUIRES_SUPPORT",
+                "message": "This account has transaction history and requires an administrator-assisted merge",
+                "details": {},
+            },
+        )
+    _sync_auth_identities(db, target)
+    _sync_auth_identities(db, user)
+    db.flush()
+    existing_providers = {
+        row.provider
+        for row in db.query(AuthIdentity).filter(AuthIdentity.user_id == user.id).all()
+    }
+    for identity in db.query(AuthIdentity).filter(AuthIdentity.user_id == target.id).all():
+        if identity.provider in existing_providers:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MERGE_IDENTITY_CONFLICT",
+                    "message": f"Both accounts already have a {identity.provider} login",
+                    "details": {},
+                },
+            )
+        identity.user_id = user.id
+        existing_providers.add(identity.provider)
+    user.phone = target.phone
+    user.phone_verified = target.phone_verified
+    target.phone = None
+    target.phone_verified = False
+    target.account_status = "suspended"
+    target.suspended_at = datetime.now(timezone.utc)
+    target.password_hash = hash_password(secrets.token_urlsafe(32))
+    revoke_user_refresh_tokens(db, target.id)
+    db.commit()
+    return _issue_tokens(db, user, request=request)
+
+
+@router.delete("/identities/{identity_id}", status_code=204)
+def unbind_auth_identity(
+    identity_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(AuthIdentity).filter(AuthIdentity.user_id == user.id).all()
+    target = next((row for row in rows if row.id == identity_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Authentication identity not found")
+    if len([row for row in rows if row.verified]) <= 1 and target.verified:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LAST_LOGIN_METHOD",
+                "message": "Bind another verified login method before unbinding this one",
+                "details": {},
+            },
+        )
+    if target.provider == "phone":
+        user.phone = None
+        user.phone_verified = False
+    elif target.provider == "wechat":
+        user.wechat_openid = None
+        user.wechat_unionid = None
+        user.wechat_bound = False
+    elif target.provider == "alipay":
+        user.alipay_bound = False
+    elif target.provider == "google":
+        user.google_sub = None
+    db.delete(target)
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/sessions")
+def list_device_sessions(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(DeviceSession)
+        .filter(DeviceSession.user_id == user.id, DeviceSession.revoked_at.is_(None))
+        .order_by(DeviceSession.last_seen_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "deviceId": row.device_id,
+            "platform": row.platform,
+            "deviceName": row.device_name,
+            "countryCode": row.country_code,
+            "suspicious": row.suspicious,
+            "lastSeenAt": row.last_seen_at.isoformat(),
+            "createdAt": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def revoke_device_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(DeviceSession)
+        .filter(DeviceSession.id == session_id, DeviceSession.user_id == user.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Device session not found")
+    row.revoked_at = datetime.now(timezone.utc)
+    if row.refresh_token_id:
+        refresh_row = db.query(RefreshToken).filter(RefreshToken.id == row.refresh_token_id).first()
+        if refresh_row:
+            refresh_row.revoked = True
+    db.commit()
+    return Response(status_code=204)

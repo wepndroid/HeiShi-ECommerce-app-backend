@@ -20,10 +20,11 @@ ALGORITHM = "HS256"
 security = HTTPBearer(auto_error=False)
 AU_PHONE_RE = re.compile(r"^(\+?61|0)\d{8,10}$")
 CN_PHONE_RE = re.compile(r"^\+861[3-9]\d{9}$")
+GLOBAL_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
 def normalize_phone(phone: str) -> str:
-    cleaned = re.sub(r"\s+", "", phone.strip())
+    cleaned = re.sub(r"[\s().-]+", "", phone.strip())
     if cleaned.startswith("+86"):
         digits = cleaned[3:]
         if re.fullmatch(r"1[3-9]\d{9}", digits):
@@ -46,7 +47,9 @@ def is_valid_phone(phone: str) -> bool:
     normalized = normalize_phone(phone)
     if normalized.startswith("+86"):
         return bool(CN_PHONE_RE.match(normalized))
-    return bool(AU_PHONE_RE.match(normalized))
+    if AU_PHONE_RE.match(normalized):
+        return True
+    return bool(GLOBAL_E164_RE.match(normalized))
 
 
 def is_valid_au_phone(phone: str) -> bool:
@@ -161,12 +164,20 @@ def get_current_user(user: User | None = Depends(get_current_user_optional)) -> 
     if not user:
         raise HTTPException(
             status_code=401,
-            detail={"code": "UNAUTHORIZED", "message": "Authentication required", "details": {}},
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Authentication is required to perform this action.",
+                "details": {},
+            },
         )
-    if user.account_status == "banned":
+    if user.account_status in {"banned", "suspended", "merged"}:
         raise HTTPException(
             status_code=403,
-            detail={"code": "FORBIDDEN", "message": "Account is banned", "details": {}},
+            detail={
+                "code": "ACCOUNT_SUSPENDED",
+                "message": "This account is not permitted to perform authenticated actions",
+                "details": {"accountStatus": user.account_status},
+            },
         )
     return user
 

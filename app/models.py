@@ -96,6 +96,61 @@ class RefreshToken(Base):
     user: Mapped[User] = relationship(back_populates="refresh_tokens")
 
 
+class AuthIdentity(Base):
+    """Normalized login identity so authentication is not tied to User columns."""
+
+    __tablename__ = "auth_identities"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_subject", name="uq_auth_identity_provider_subject"),
+        UniqueConstraint("user_id", "provider", name="uq_auth_identity_user_provider"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(20), index=True)
+    provider_subject: Mapped[str] = mapped_column(String(255), index=True)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    bound_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DeviceSession(Base):
+    __tablename__ = "device_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    refresh_token_id: Mapped[str | None] = mapped_column(
+        ForeignKey("refresh_tokens.id"), nullable=True, index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(255), index=True)
+    platform: Mapped[str] = mapped_column(String(20), default="unknown")
+    device_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    suspicious: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LoginAuditLog(Base):
+    __tablename__ = "login_audit_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(20), default="phone")
+    subject_hint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(30), index=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    failure_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class PhoneOtp(Base):
     __tablename__ = "phone_otps"
 
@@ -186,6 +241,53 @@ class Listing(Base):
     @bundle_meta.setter
     def bundle_meta(self, value: dict) -> None:
         self.bundle_meta_json = json.dumps(value)
+
+
+class MediaAsset(Base):
+    __tablename__ = "media_assets"
+    __table_args__ = (
+        UniqueConstraint("storage_key", name="uq_media_asset_storage_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    listing_id: Mapped[int | None] = mapped_column(
+        ForeignKey("listings.id"), nullable=True, index=True
+    )
+    media_type: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING_UPLOAD", index=True)
+    original_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[str] = mapped_column(String(100))
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    storage_key: Mapped[str] = mapped_column(String(500))
+    original_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    variants_json: Mapped[str] = mapped_column(Text, default="{}")
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    moderation_status: Mapped[str] = mapped_column(String(30), default="pending")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UploadSession(Base):
+    __tablename__ = "upload_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    media_asset_id: Mapped[str] = mapped_column(ForeignKey("media_assets.id"), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    provider_upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING_UPLOAD", index=True)
+    uploaded_parts_json: Mapped[str] = mapped_column(Text, default="[]")
+    bytes_uploaded: Mapped[int] = mapped_column(Integer, default=0)
+    total_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class Order(Base):
@@ -316,9 +418,62 @@ class Message(Base):
     conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
     sender_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     text: Mapped[str] = mapped_column(Text)
+    message_type: Mapped[str] = mapped_column(String(30), default="text")
+    structured_payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    official_platform_message: Mapped[bool] = mapped_column(Boolean, default=False)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class PrivateOffer(Base):
+    __tablename__ = "private_offers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    product_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
+    seller_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    buyer_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    original_price: Mapped[float] = mapped_column(Float)
+    negotiated_price: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String(3), default="AUD")
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    shipping_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    total_amount: Mapped[float] = mapped_column(Float)
+    expiration_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, unique=True)
+
+
+class AdminConversation(Base):
+    __tablename__ = "admin_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    conversation_type: Mapped[str] = mapped_column(String(30), index=True)
+    admin_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    user_role_context: Mapped[str] = mapped_column(String(20), index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    subject: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AdminSupportMessage(Base):
+    __tablename__ = "admin_support_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("admin_conversations.id"), index=True)
+    sender_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    sender_role: Mapped[str] = mapped_column(String(20))
+    body: Mapped[str] = mapped_column(Text)
+    official_platform_message: Mapped[bool] = mapped_column(Boolean, default=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Address(Base):
@@ -446,7 +601,55 @@ class SystemNotification(Base):
     body_zh: Mapped[str | None] = mapped_column(Text, nullable=True)
     action_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
     action_ref: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    user_role_context: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    notification_type: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    business_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    business_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    deep_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    push_status: Mapped[str] = mapped_column(String(20), default="pending")
     unread: Mapped[bool] = mapped_column(Boolean, default=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NotificationPreference(Base):
+    __tablename__ = "notification_preferences"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "user_role_context", "category", name="uq_notification_preference_context"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    user_role_context: Mapped[str] = mapped_column(String(20), index=True)
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    in_app_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    push_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class NotificationDispatch(Base):
+    __tablename__ = "notification_dispatches"
+    __table_args__ = (
+        UniqueConstraint("deduplication_key", name="uq_notification_dispatch_dedup"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    notification_id: Mapped[str | None] = mapped_column(
+        ForeignKey("system_notifications.id"), nullable=True, index=True
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    channel: Mapped[str] = mapped_column(String(20), index=True)
+    deduplication_key: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -600,6 +803,65 @@ class PromotionClickEvent(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ExposureRule(Base):
+    __tablename__ = "exposure_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    product_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
+    rule_type: Mapped[str] = mapped_column(String(30), index=True)
+    exposure_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    target_region: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    target_category: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ShareRecord(Base):
+    __tablename__ = "share_records"
+    __table_args__ = (UniqueConstraint("share_token", name="uq_share_record_token"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    share_token: Mapped[str] = mapped_column(String(64), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
+    sharer_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    share_channel: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    campaign_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+    conversion_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ShareAttributionEvent(Base):
+    __tablename__ = "share_attribution_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    share_id: Mapped[str] = mapped_column(ForeignKey("share_records.id"), index=True)
+    anonymous_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(30), index=True)
+    business_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AnonymousSession(Base):
+    __tablename__ = "anonymous_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    device_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    consent_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    linked_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

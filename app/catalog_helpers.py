@@ -1,9 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Query, Session
 
-from app.models import Listing, Order
+from app.models import Conversation, ExposureRule, Listing, Order, Review
 
 PENDING_PAY_STATUS = "pendingPay"
 
@@ -83,10 +83,79 @@ def apply_tab_filter(q: Query, tab: str | None) -> Query:
 
 
 def apply_feed_sort(q: Query) -> Query:
-    """Pinned and recommended listings surface first, then newest."""
+    """Apply active admin exposure rules, then the normal organic ranking.
+
+    A correlated subquery avoids duplicate listings when more than one rule targets
+    the same product. Suppression is server-enforced and expired rules have no effect.
+    """
+    now = datetime.now(timezone.utc)
+    target_matches = and_(
+        or_(
+            ExposureRule.target_region.is_(None),
+            ExposureRule.target_region == Listing.region_state,
+            ExposureRule.target_region == Listing.region_city,
+            ExposureRule.target_region == Listing.region_area,
+        ),
+        or_(
+            ExposureRule.target_category.is_(None),
+            ExposureRule.target_category == Listing.category_key,
+        ),
+    )
+    active_rule = and_(
+        ExposureRule.product_id == Listing.id,
+        ExposureRule.status == "active",
+        or_(ExposureRule.start_time.is_(None), ExposureRule.start_time <= now),
+        or_(ExposureRule.end_time.is_(None), ExposureRule.end_time > now),
+        target_matches,
+    )
+    suppressed = exists(
+        select(ExposureRule.id).where(
+            active_rule,
+            ExposureRule.rule_type.in_(("suppress", "exclude")),
+        )
+    )
+    pinned = exists(
+        select(ExposureRule.id).where(active_rule, ExposureRule.rule_type == "pin")
+    )
+    exposure_weight = (
+        select(func.max(ExposureRule.exposure_weight))
+        .where(active_rule, ExposureRule.rule_type != "suppress")
+        .correlate(Listing)
+        .scalar_subquery()
+    )
+    conversation_count = (
+        select(func.count(Conversation.id))
+        .where(Conversation.listing_id == Listing.id)
+        .correlate(Listing)
+        .scalar_subquery()
+    )
+    completed_order_count = (
+        select(func.count(Order.id))
+        .where(Order.listing_id == Listing.id, Order.status.in_(("completed", "pendingReview")))
+        .correlate(Listing)
+        .scalar_subquery()
+    )
+    seller_rating = (
+        select(func.avg(Review.rating))
+        .join(Order, Review.order_id == Order.id)
+        .where(Order.seller_id == Listing.seller_id, Review.is_hidden.is_(False), Review.is_removed.is_(False))
+        .correlate(Listing)
+        .scalar_subquery()
+    )
+    organic_score = (
+        func.coalesce(Listing.favorite_count, 0) * 0.25
+        + func.coalesce(Listing.view_count, 0) * 0.01
+        + func.coalesce(conversation_count, 0) * 0.2
+        + func.coalesce(completed_order_count, 0) * 1.0
+        + func.coalesce(seller_rating, 0) * 0.1
+    )
+    q = q.filter(~suppressed)
     return q.order_by(
+        pinned.desc(),
+        func.coalesce(exposure_weight, 1.0).desc(),
         Listing.is_pinned.desc(),
         Listing.is_recommended.desc(),
+        organic_score.desc(),
         Listing.created_at.desc(),
     )
 

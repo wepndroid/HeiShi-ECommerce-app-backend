@@ -17,6 +17,50 @@ CHAT_CHANNEL_ID = "chat-messages"
 ORDER_CHANNEL_ID = "order-updates"
 
 
+def send_generic_push(
+    db: Session,
+    *,
+    user_id: str,
+    title: str,
+    body: str,
+    data: dict,
+) -> tuple[bool, str | None]:
+    """Send one business notification to every registered device for a user."""
+    rows = db.query(DevicePushToken).filter(DevicePushToken.user_id == user_id).all()
+    if not rows:
+        return False, "NO_REGISTERED_DEVICE"
+    messages = []
+    for row in rows:
+        payload: dict = {
+            "to": row.token,
+            "title": title,
+            "body": body,
+            "data": data,
+            "sound": "default",
+            "priority": "high",
+        }
+        if row.platform == "android":
+            payload["channelId"] = ORDER_CHANNEL_ID
+        messages.append(payload)
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                EXPO_PUSH_URL,
+                json=messages,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+        if response.status_code != 200:
+            return False, f"HTTP_{response.status_code}"
+        tickets = response.json().get("data")
+        if not isinstance(tickets, list):
+            return False, "INVALID_PROVIDER_RESPONSE"
+        successful = any(isinstance(ticket, dict) and ticket.get("status") == "ok" for ticket in tickets)
+        return successful, None if successful else "PROVIDER_REJECTED"
+    except Exception as exc:
+        logger.warning("Expo generic push request failed: %s", exc)
+        return False, "NETWORK_ERROR"
+
+
 def _chat_push_title(sender_name: str, lang: str) -> str:
     if lang.startswith("zh"):
         return f"{sender_name} 发来新消息"
