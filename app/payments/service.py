@@ -38,8 +38,9 @@ def start_checkout(
     customer_id: str | None = None
     payment_method_id: str | None = None
     payee_merchant_id: str | None = None
-    # For card checkout, charge the buyer's saved Stripe card via a PaymentIntent.
-    if payment_method == "card" and db is not None and adapter.psp == "stripe":
+    # Native card and Google Pay checkout both use a PaymentIntent. Google Pay
+    # confirms that intent from Stripe's Android Platform Pay sheet.
+    if payment_method in {"card", "google"} and db is not None and adapter.psp == "stripe":
         buyer = db.query(User).filter(User.id == order.buyer_id).first()
         customer_id = getattr(buyer, "stripe_customer_id", None) if buyer else None
         if native_payment_sheet and buyer and not customer_id:
@@ -48,16 +49,17 @@ def start_checkout(
             customer_id = stripe_service.ensure_customer(buyer)
             buyer.stripe_customer_id = customer_id
             db.flush()
-        pm = (
-            db.query(PaymentMethod)
-            .filter(
-                PaymentMethod.user_id == order.buyer_id,
-                PaymentMethod.stripe_payment_method_id.isnot(None),
+        if payment_method == "card":
+            pm = (
+                db.query(PaymentMethod)
+                .filter(
+                    PaymentMethod.user_id == order.buyer_id,
+                    PaymentMethod.stripe_payment_method_id.isnot(None),
+                )
+                .order_by(PaymentMethod.is_default.desc())
+                .first()
             )
-            .order_by(PaymentMethod.is_default.desc())
-            .first()
-        )
-        payment_method_id = pm.stripe_payment_method_id if pm else None
+            payment_method_id = pm.stripe_payment_method_id if pm else None
     if payment_method == "paypal" and db is not None and adapter.psp == "paypal":
         payout = (
             db.query(PayoutMethod)

@@ -1363,6 +1363,11 @@ def _order_admin_summary(row: Order) -> dict:
         "psp": row.psp,
         "pspTransactionId": row.psp_transaction_id,
         "pspPaymentId": row.psp_payment_id,
+        "refundStatus": getattr(row, "refund_status", None),
+        "refundReference": getattr(row, "refund_reference", None),
+        "refundFailureCode": getattr(row, "refund_failure_code", None),
+        "refundFailureReason": getattr(row, "refund_failure_reason", None),
+        "refundedAt": row.refunded_at.isoformat() if getattr(row, "refunded_at", None) else None,
         "payoutPaused": row.payout_paused,
         "payoutStatus": getattr(row, "payout_status", None),
         "payoutProvider": getattr(row, "payout_provider", None),
@@ -1479,7 +1484,7 @@ def resolve_dispute(
                 },
             )
         refund_transition = refund_order_payment(order)
-        if refund_transition.status != "refunded":
+        if refund_transition.status not in ("refunded", "pending"):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -1488,8 +1493,14 @@ def resolve_dispute(
                     "details": {},
                 },
             )
-        order.status = "refunded"
-        order.payout_paused = False
+        if refund_transition.status == "refunded":
+            order.status = "refunded"
+            order.dispute_status = "resolved"
+            order.payout_paused = False
+        else:
+            order.status = "refundInProgress"
+            order.dispute_status = "refund_pending"
+            order.payout_paused = True
     elif body.resolution == "complete":
         order.status = "completed"
         order.payout_paused = False
@@ -1516,7 +1527,12 @@ def resolve_dispute(
         after={"resolution": body.resolution, "note": body.note},
     )
     db.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "orderStatus": order.status,
+        "refundStatus": getattr(order, "refund_status", None),
+        "refundReference": getattr(order, "refund_reference", None),
+    }
 
 
 @router.get("/config/categories")

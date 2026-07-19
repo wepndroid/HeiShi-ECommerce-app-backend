@@ -37,7 +37,7 @@ class StripeAdapter:
                 psp_payment_id=payment_id,
             )
 
-        if payment_method == "card" and native_payment_sheet and customer_id:
+        if payment_method in {"card", "google"} and native_payment_sheet and customer_id:
             from app import stripe_service
 
             try:
@@ -105,6 +105,9 @@ class StripeAdapter:
             data["payment_method_types[0]"] = "alipay"
         elif payment_method == "wechat":
             data["payment_method_types[0]"] = "wechat_pay"
+            # Stripe requires the client platform to be explicit for WeChat Pay
+            # Checkout Sessions. This flow opens Stripe's hosted web checkout.
+            data["payment_method_options[wechat_pay][client]"] = "web"
         else:
             # Card checkout on Stripe-hosted Checkout also surfaces Apple Pay / Google Pay
             # automatically when the account, browser, and device are eligible.

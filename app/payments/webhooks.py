@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Order
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
+from app.payments.refunds import apply_stripe_refund_update
 
 
 def _order_by_psp_payment(db: Session, psp: str, psp_payment_id: str) -> Order | None:
@@ -23,6 +24,39 @@ def _order_by_psp_payment(db: Session, psp: str, psp_payment_id: str) -> Order |
 
 def _order_by_metadata(db: Session, order_id: int) -> Order | None:
     return db.query(Order).filter(Order.id == order_id).first()
+
+
+def _order_for_stripe_refund(db: Session, refund: dict) -> Order | None:
+    metadata = refund.get("metadata") or {}
+    order_id = metadata.get("order_id")
+    if order_id:
+        try:
+            order = _order_by_metadata(db, int(order_id))
+        except (TypeError, ValueError):
+            order = None
+        if order:
+            return order
+    refund_id = refund.get("id")
+    if refund_id:
+        order = (
+            db.query(Order)
+            .filter(Order.psp == "stripe", Order.refund_reference == refund_id)
+            .first()
+        )
+        if order:
+            return order
+    payment_intent_id = refund.get("payment_intent")
+    if payment_intent_id:
+        return (
+            db.query(Order)
+            .filter(
+                Order.psp == "stripe",
+                (Order.psp_transaction_id == payment_intent_id)
+                | (Order.psp_payment_id == payment_intent_id),
+            )
+            .first()
+        )
+    return None
 
 
 def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) -> bool:
@@ -38,6 +72,24 @@ def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) ->
         event = json.loads(payload)
     event_type = event.get("type", "")
     data_object = event.get("data", {}).get("object", {})
+    if event_type in ("refund.created", "refund.updated", "refund.failed"):
+        order = _order_for_stripe_refund(db, data_object)
+        if order:
+            transition = apply_stripe_refund_update(order, data_object)
+            if transition.status == "refunded":
+                order.status = "refunded"
+                order.dispute_status = "resolved"
+                order.payout_paused = False
+            elif transition.status == "pending":
+                order.status = "refundInProgress"
+                order.dispute_status = "refund_pending"
+                order.payout_paused = True
+            else:
+                order.status = "inDispute"
+                order.dispute_status = "refund_failed"
+                order.payout_paused = True
+            db.commit()
+        return True
     if event_type in ("payment_intent.succeeded", "checkout.session.completed"):
         psp_id = data_object.get("id")
         if event_type == "checkout.session.completed":

@@ -6,7 +6,6 @@ from sqlalchemy.orm import Query, Session
 from app.models import Listing, Order
 
 PENDING_PAY_STATUS = "pendingPay"
-ORDER_FEED_STATUSES = ("pendingShip", "pendingReceive", "pendingReview", "completed")
 
 OTHER_AREAS = "其他地区"
 ALL_AREAS = "全部区域"
@@ -98,20 +97,14 @@ def exclude_unpaid_reserved(q: Query, db: Session, viewer_user_id: str | None = 
 
 
 def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None) -> Query:
-    """Public feed: active listings with admin-approved review status."""
-    approved = (Listing.status == "active") & (Listing.review_status == "approved")
-    if not user_id:
-        return q.filter(approved)
-    linked_listing_ids = (
-        db.query(Order.listing_id)
-        .filter(
-            Order.status.in_(ORDER_FEED_STATUSES),
-            (Order.buyer_id == user_id) | (Order.seller_id == user_id),
-        )
-        .distinct()
-    )
-    own_listings = Listing.seller_id == user_id
-    return q.filter(or_(approved, Listing.id.in_(linked_listing_ids), own_listings))
+    """General discovery feeds contain only approved, currently purchasable listings.
+
+    Transaction participants can still open sold/inactive listings through their order,
+    chat, review, and sales-history routes.  Those records must not leak back into Home,
+    Search, Related, or category feeds merely because the viewer participated in an order
+    or owns the listing.
+    """
+    return q.filter(Listing.status == "active", Listing.review_status == "approved")
 
 
 def apply_public_listing_visibility_filter(q: Query) -> Query:

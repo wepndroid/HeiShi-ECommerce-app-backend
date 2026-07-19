@@ -396,6 +396,10 @@ def _release_wechat_payout(order: Order, payout_method: PayoutMethod, amount_min
 
 def release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
     """Attempt to release seller funds to the seller's configured payout destination."""
+    if getattr(order, "refund_status", None) == "pending":
+        return _set_blocked(order, "REFUND_PENDING", "Payout is blocked while the buyer refund is pending")
+    if getattr(order, "refund_status", None) == "failed":
+        return _set_blocked(order, "REFUND_FAILED", "Payout is blocked because the buyer refund failed")
     if order.payout_provider in ASYNC_PAYOUT_PROVIDERS and order.payout_status == PAYOUT_PROCESSING:
         payout_method = _preferred_method(db, order.seller_id, order.payout_provider)
         if not payout_method:
