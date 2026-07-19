@@ -9,11 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.media_processing import MediaValidationError, process_image_variants
-from app.models import Conversation, Listing, Order, User
+from app.models import AnonymousSession, Conversation, Listing, Order, User
 from app.routers.platform_features import (
     CreateOfferRequest,
+    PendingActionRequest,
     PreferenceUpdate,
     accept_private_offer,
+    consume_pending_action,
+    create_pending_action,
     create_private_offer,
     update_notification_preference,
 )
@@ -137,6 +140,27 @@ class PlatformFeatureTests(unittest.TestCase):
     def test_corrupt_image_is_rejected(self):
         with self.assertRaises(MediaValidationError):
             process_image_variants(b"not-an-image")
+
+    def test_pending_action_is_bound_to_authenticated_user_and_idempotent(self):
+        anonymous = AnonymousSession()
+        self.db.add(anonymous)
+        self.db.commit()
+        pending = create_pending_action(
+            PendingActionRequest(
+                actionType="purchase",
+                returnPath=f"/detail/{self.listing.id}",
+                anonymousSessionId=anonymous.id,
+            ),
+            self.db,
+        )
+        consumed = consume_pending_action(pending["id"], self.buyer, self.db)
+        repeated = consume_pending_action(pending["id"], self.buyer, self.db)
+        self.assertEqual(consumed["returnPath"], f"/detail/{self.listing.id}")
+        self.assertFalse(consumed["idempotent"])
+        self.assertTrue(repeated["idempotent"])
+        with self.assertRaises(HTTPException) as forbidden:
+            consume_pending_action(pending["id"], self.stranger, self.db)
+        self.assertEqual(forbidden.exception.status_code, 403)
 
 
 if __name__ == "__main__":

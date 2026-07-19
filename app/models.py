@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -862,6 +863,24 @@ class AnonymousSession(Base):
     linked_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PendingAction(Base):
+    __tablename__ = "pending_actions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: secrets.token_urlsafe(32))
+    anonymous_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("anonymous_sessions.id"),
+        nullable=True,
+        index=True,
+    )
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(50), index=True)
+    return_path: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

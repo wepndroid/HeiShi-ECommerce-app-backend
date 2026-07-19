@@ -31,6 +31,7 @@ from app.models import (
     Message,
     NotificationPreference,
     Order,
+    PendingAction,
     PrivateOffer,
     ShareAttributionEvent,
     ShareRecord,
@@ -979,6 +980,94 @@ def link_anonymous_session(
     row.last_seen_at = utcnow()
     db.commit()
     return {"id": row.id, "linkedUserId": user.id}
+
+
+class PendingActionRequest(BaseModel):
+    action_type: str = Field(alias="actionType", min_length=1, max_length=50)
+    return_path: str = Field(alias="returnPath", min_length=1, max_length=500)
+    anonymous_session_id: str | None = Field(default=None, alias="anonymousSessionId")
+
+
+@router.post("/pending-actions", status_code=201)
+def create_pending_action(body: PendingActionRequest, db: Session = Depends(get_db)):
+    if not body.return_path.startswith("/") or "://" in body.return_path:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_RETURN_PATH",
+                "message": "returnPath must be an application-relative path",
+                "details": {},
+            },
+        )
+    if body.anonymous_session_id:
+        anonymous = (
+            db.query(AnonymousSession)
+            .filter(AnonymousSession.id == body.anonymous_session_id)
+            .first()
+        )
+        if not anonymous or (
+            anonymous.expires_at and ensure_utc(anonymous.expires_at) <= utcnow()
+        ):
+            raise _not_found("Anonymous session")
+    row = PendingAction(
+        anonymous_session_id=body.anonymous_session_id,
+        action_type=body.action_type,
+        return_path=body.return_path,
+        expires_at=utcnow() + timedelta(minutes=30),
+    )
+    db.add(row)
+    db.commit()
+    return {
+        "id": row.id,
+        "actionType": row.action_type,
+        "returnPath": row.return_path,
+        "expiresAt": ensure_utc(row.expires_at).isoformat(),
+    }
+
+
+@router.post("/pending-actions/{action_id}/consume")
+def consume_pending_action(
+    action_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(PendingAction).filter(PendingAction.id == action_id).with_for_update().first()
+    if not row:
+        raise _not_found("Pending action")
+    if row.status == "consumed":
+        if row.user_id != user.id:
+            raise _forbidden("This pending action belongs to another account")
+        return {
+            "id": row.id,
+            "actionType": row.action_type,
+            "returnPath": row.return_path,
+            "idempotent": True,
+        }
+    if ensure_utc(row.expires_at) <= utcnow():
+        row.status = "expired"
+        db.commit()
+        raise _conflict("PENDING_ACTION_EXPIRED", "Pending action has expired")
+    if row.anonymous_session_id:
+        anonymous = (
+            db.query(AnonymousSession)
+            .filter(AnonymousSession.id == row.anonymous_session_id)
+            .first()
+        )
+        if anonymous and anonymous.linked_user_id not in {None, user.id}:
+            raise _forbidden("This pending action belongs to another account")
+        if anonymous:
+            anonymous.linked_user_id = user.id
+            anonymous.last_seen_at = utcnow()
+    row.user_id = user.id
+    row.status = "consumed"
+    row.consumed_at = utcnow()
+    db.commit()
+    return {
+        "id": row.id,
+        "actionType": row.action_type,
+        "returnPath": row.return_path,
+        "idempotent": False,
+    }
 
 
 class PreferenceUpdate(BaseModel):
