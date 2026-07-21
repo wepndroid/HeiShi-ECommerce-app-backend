@@ -47,7 +47,11 @@ def _sign(content: str) -> str:
     return base64.b64encode(signature).decode("ascii")
 
 
-def _signed_params(api_method: str, biz_content: dict) -> dict[str, str]:
+def _signed_params(
+    api_method: str,
+    biz_content: dict | None = None,
+    **method_params: str,
+) -> dict[str, str]:
     app_id = settings.alipay_app_id.strip()
     if not app_id:
         raise AlipayPayoutError("Alipay app id is not configured")
@@ -60,8 +64,14 @@ def _signed_params(api_method: str, biz_content: dict) -> dict[str, str]:
         "sign_type": "RSA2",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "version": "1.0",
-        "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
     }
+    if biz_content is not None:
+        params["biz_content"] = json.dumps(
+            biz_content,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    params.update({key: value for key, value in method_params.items() if value})
     sign_content = "&".join(f"{key}={params[key]}" for key in sorted(params))
     params["sign"] = _sign(sign_content)
     return params
@@ -111,3 +121,27 @@ def create_transfer(
 
 def query_transfer(out_biz_no: str) -> dict:
     return _gateway_call("alipay.fund.trans.common.query", {"out_biz_no": out_biz_no})
+
+
+def exchange_authorization_code(auth_code: str) -> dict:
+    """Exchange a user-authorized Alipay code for a verified Alipay identity."""
+    code = auth_code.strip()
+    if not code:
+        raise AlipayPayoutError("Alipay authorization code is required")
+    api_method = "alipay.system.oauth.token"
+    params = _signed_params(
+        api_method,
+        grant_type="authorization_code",
+        code=code,
+    )
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(_base_url(), data=params)
+    if response.status_code >= 400:
+        raise AlipayPayoutError(f"Alipay authorization failed: {response.text[:300]}")
+    payload = response.json()
+    body = payload.get("alipay_system_oauth_token_response") or {}
+    subject = body.get("user_id") or body.get("open_id")
+    if not subject:
+        error = body.get("sub_msg") or body.get("msg") or "Alipay did not return a user identity"
+        raise AlipayPayoutError(str(error))
+    return body

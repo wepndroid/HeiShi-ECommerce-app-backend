@@ -1,6 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import base64
+import hashlib
+import hmac
 import json
 import secrets
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -12,6 +16,7 @@ from app.auth import (
     create_refresh_token,
     generate_heishi_id,
     get_current_user,
+    hash_refresh_token,
     hash_password,
     is_valid_au_phone,
     normalize_phone,
@@ -21,10 +26,13 @@ from app.auth import (
     verify_password,
 )
 from app.analytics import record_daily_active_user
+from app.account_merge import account_has_cross_domain_state
+from app.alipay_payout_service import AlipayPayoutError, exchange_authorization_code
 from app.catalog_helpers import get_or_create_settings
 from app.config import settings
 from app.coupon_service import issue_welcome_coupon
 from app.database import get_db
+from app.notification_jobs import enqueue_notification
 from app.models import (
     AuthIdentity,
     Conversation,
@@ -52,6 +60,7 @@ from app.twilio_otp import TwilioOtpError, send_sms_verification, verify_sms_cod
 from app.schemas import (
     AuthTokensDto,
     AuthUserDto,
+    AlipayAuthRequest,
     GoogleDevAuthRequest,
     GoogleAuthRequest,
     LoginRequest,
@@ -67,6 +76,7 @@ from app.schemas import (
     BindPhoneRequest,
     VerifyBindPhoneRequest,
     MergePhoneAccountRequest,
+    MergeThirdPartyAccountRequest,
 )
 from app.serializers import user_to_dto
 from app.supabase_auth import (
@@ -76,6 +86,56 @@ from app.supabase_auth import (
     name_from_claims,
     phone_from_claims,
 )
+
+
+def _issue_alipay_oauth_state() -> str:
+    issued_at = int(datetime.now(timezone.utc).timestamp())
+    payload = f"{issued_at}.{secrets.token_urlsafe(18)}"
+    signature = hmac.new(
+        settings.jwt_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload}.{encoded_signature}"
+
+
+def _validate_alipay_oauth_state(state: str | None) -> None:
+    # Native Alipay SDK callbacks are protected by the SDK/application
+    # signature and do not carry browser state. Browser callbacks issued by
+    # /auth/alipay/authorize always include and validate this state.
+    if state is None:
+        return
+    try:
+        issued_raw, nonce, signature = state.split(".", 2)
+        issued_at = int(issued_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ALIPAY_OAUTH_STATE_INVALID",
+                "message": "Alipay authorization state is invalid",
+                "details": {},
+            },
+        )
+    payload = f"{issued_raw}.{nonce}"
+    expected = base64.urlsafe_b64encode(
+        hmac.new(
+            settings.jwt_secret.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("ascii").rstrip("=")
+    age_seconds = int(datetime.now(timezone.utc).timestamp()) - issued_at
+    if not hmac.compare_digest(signature, expected) or not 0 <= age_seconds <= 600:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ALIPAY_OAUTH_STATE_INVALID",
+                "message": "Alipay authorization state is invalid or expired",
+                "details": {},
+            },
+        )
 from app.routers.region_safety import REGION_DATA
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -85,6 +145,33 @@ KNOWN_CITY_NAMES = {city.name for region in REGION_DATA for city in region.citie
 WECHAT_ACCESS_TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token"
 WECHAT_USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo"
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
+
+
+def _record_login_failure(
+    db: Session,
+    request: Request,
+    *,
+    provider: str,
+    failure_code: str,
+    subject_hint: str | None = None,
+    device_id: str | None = None,
+    user_id: str | None = None,
+) -> None:
+    """Persist a provider-neutral failed authentication audit event."""
+    db.add(
+        LoginAuditLog(
+            user_id=user_id,
+            provider=provider,
+            subject_hint=subject_hint,
+            event_type="login_failure",
+            success=False,
+            failure_code=failure_code,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            device_id=device_id,
+        )
+    )
+    db.commit()
 
 
 def _valid_avatar_url(url: str) -> bool:
@@ -486,7 +573,7 @@ def oauth_provision(
 
 
 @router.post("/wechat", response_model=AuthTokensDto)
-def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
+def wechat_login(body: WeChatAuthRequest, request: Request, db: Session = Depends(get_db)):
     """Sign in or register via native WeChat Open Platform authorization code.
 
     The mobile app obtains a one-time WeChat ``code`` from the native SDK. The
@@ -494,7 +581,19 @@ def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
     the same HeyMarket JWT session used by phone registration/login.
     """
 
-    profile = _wechat_exchange_code(body.code)
+    try:
+        profile = _wechat_exchange_code(body.code)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        _record_login_failure(
+            db,
+            request,
+            provider="wechat",
+            failure_code=str(detail.get("code") or "WECHAT_AUTH_FAILED"),
+            subject_hint="wechat_authorization",
+            device_id=body.deviceId,
+        )
+        raise
     openid = profile["openid"]
     unionid = profile.get("unionid")
     user = _find_wechat_user(db, openid, unionid)
@@ -511,7 +610,15 @@ def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
             user.avatar_url = avatar_url
         db.commit()
         db.refresh(user)
-        return _issue_tokens(db, user)
+        return _issue_tokens(
+            db,
+            user,
+            request=request,
+            device_id=body.deviceId,
+            platform=body.platform,
+            device_name=body.deviceName,
+            auth_provider="wechat",
+        )
 
     nickname = (
         (body.nickname.strip() if body.nickname else None)
@@ -539,11 +646,199 @@ def wechat_login(body: WeChatAuthRequest, db: Session = Depends(get_db)):
     issue_welcome_coupon(db, user.id, user.language)
     db.commit()
     db.refresh(user)
-    return _issue_tokens(db, user)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        auth_provider="wechat",
+    )
+
+
+@router.get("/alipay/authorize")
+def alipay_authorize():
+    """Return a short-lived, CSRF-protected Alipay user-authorization URL."""
+    app_id = settings.alipay_app_id.strip()
+    redirect_uri = settings.alipay_oauth_redirect_url.strip()
+    if not app_id or not redirect_uri:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ALIPAY_AUTH_NOT_CONFIGURED",
+                "message": "Alipay authorization is not configured",
+                "details": {},
+            },
+        )
+    state = _issue_alipay_oauth_state()
+    query = urlencode(
+        {
+            "app_id": app_id,
+            "scope": "auth_user",
+            "redirect_uri": redirect_uri,
+            "state": state,
+        }
+    )
+    return {
+        "authorizationUrl": (
+            "https://openauth.alipay.com/oauth2/publicAppAuthorize.htm?"
+            f"{query}"
+        ),
+        "state": state,
+        "redirectUri": redirect_uri,
+        "expiresIn": 600,
+    }
+
+
+@router.post("/alipay", response_model=AuthTokensDto)
+def alipay_login(
+    body: AlipayAuthRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Sign in or register using a server-verified Alipay OAuth code."""
+    try:
+        _validate_alipay_oauth_state(body.oauthState)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        _record_login_failure(
+            db,
+            request,
+            provider="alipay",
+            failure_code=str(detail.get("code") or "ALIPAY_OAUTH_STATE_INVALID"),
+            subject_hint="alipay_authorization",
+            device_id=body.deviceId,
+        )
+        raise
+    try:
+        profile = exchange_authorization_code(body.authCode)
+    except AlipayPayoutError as exc:
+        _record_login_failure(
+            db,
+            request,
+            provider="alipay",
+            failure_code="ALIPAY_AUTH_FAILED",
+            subject_hint="alipay_authorization",
+            device_id=body.deviceId,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ALIPAY_AUTH_FAILED",
+                "message": str(exc),
+                "details": {},
+            },
+        ) from exc
+    subject = str(profile.get("user_id") or profile.get("open_id") or "").strip()
+    if not subject:
+        _record_login_failure(
+            db,
+            request,
+            provider="alipay",
+            failure_code="ALIPAY_IDENTITY_MISSING",
+            subject_hint="alipay_authorization",
+            device_id=body.deviceId,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ALIPAY_IDENTITY_MISSING",
+                "message": "Alipay did not return a user identity",
+                "details": {},
+            },
+        )
+    identity = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == "alipay",
+            AuthIdentity.provider_subject == subject,
+        )
+        .first()
+    )
+    if identity:
+        user = db.query(User).filter(User.id == identity.user_id).first()
+        if not user:
+            _record_login_failure(
+                db,
+                request,
+                provider="alipay",
+                failure_code="AUTH_IDENTITY_ORPHANED",
+                subject_hint=subject,
+                device_id=body.deviceId,
+                user_id=identity.user_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "AUTH_IDENTITY_ORPHANED",
+                    "message": "The Alipay identity is not linked to a valid account",
+                    "details": {},
+                },
+            )
+        identity.verified = True
+        identity.last_used_at = datetime.now(timezone.utc)
+        user.alipay_bound = True
+        db.commit()
+        return _issue_tokens(
+            db,
+            user,
+            request=request,
+            device_id=body.deviceId,
+            platform=body.platform,
+            device_name=body.deviceName,
+            auth_provider="alipay",
+        )
+
+    nickname = (
+        (body.nickname.strip() if body.nickname else None)
+        or str(profile.get("nick_name") or profile.get("nick") or "").strip()
+        or "Alipay user"
+    )
+    user = User(
+        nickname=nickname[:50],
+        phone=None,
+        email=None,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        heishi_id=generate_heishi_id(db, subject),
+        city=_valid_optional_city(body.city),
+        phone_verified=False,
+        alipay_bound=True,
+    )
+    db.add(user)
+    db.flush()
+    db.add(
+        AuthIdentity(
+            user_id=user.id,
+            provider="alipay",
+            provider_subject=subject,
+            verified=True,
+            metadata_json=json.dumps(
+                {
+                    "userId": profile.get("user_id"),
+                    "openId": profile.get("open_id"),
+                }
+            ),
+            last_used_at=datetime.now(timezone.utc),
+        )
+    )
+    get_or_create_settings(db, user.id)
+    issue_welcome_coupon(db, user.id, user.language)
+    db.commit()
+    db.refresh(user)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        auth_provider="alipay",
+    )
 
 
 @router.post("/google/login", response_model=AuthTokensDto)
-def google_login(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+def google_login(body: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)):
     """Sign in an existing account via native Google Sign-In ID token."""
 
     profile = _google_exchange_id_token(body.idToken)
@@ -568,11 +863,19 @@ def google_login(body: GoogleAuthRequest, db: Session = Depends(get_db)):
     _apply_google_profile_to_user(user, profile)
     db.commit()
     db.refresh(user)
-    return _issue_tokens(db, user)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        auth_provider="google",
+    )
 
 
 @router.post("/google/register", response_model=AuthTokensDto)
-def google_register(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+def google_register(body: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)):
     """Register a new account via native Google Sign-In ID token."""
 
     profile = _google_exchange_id_token(body.idToken)
@@ -599,14 +902,22 @@ def google_register(body: GoogleAuthRequest, db: Session = Depends(get_db)):
     user = _create_google_user(db, body, profile)
     db.commit()
     db.refresh(user)
-    return _issue_tokens(db, user)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        auth_provider="google",
+    )
 
 
 @router.post("/google", response_model=AuthTokensDto)
-def google_login_legacy(body: GoogleAuthRequest, db: Session = Depends(get_db)):
+def google_login_legacy(body: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)):
     """Backward-compatible strict Google login endpoint."""
 
-    return google_login(body, db)
+    return google_login(body, request, db)
 
 
 @router.post("/google/dev-register", response_model=AuthTokensDto)
@@ -643,7 +954,7 @@ def google_dev_register(body: GoogleDevAuthRequest, db: Session = Depends(get_db
     issue_welcome_coupon(db, user.id, user.language)
     db.commit()
     db.refresh(user)
-    return _issue_tokens(db, user)
+    return _issue_tokens(db, user, auth_provider="google_dev")
 
 
 def _validation_error(message: str = "Invalid phone format") -> HTTPException:
@@ -751,6 +1062,35 @@ def _sync_auth_identities(db: Session, user: User) -> None:
             existing.last_used_at = datetime.now(timezone.utc)
 
 
+def _apply_identity_to_legacy_user(user: User, identity: AuthIdentity) -> None:
+    """Keep legacy login columns synchronized during the normalized migration."""
+    try:
+        metadata = json.loads(identity.metadata_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if identity.provider == "phone":
+        user.phone = identity.provider_subject
+        user.phone_verified = identity.verified
+    elif identity.provider == "wechat":
+        user.wechat_openid = metadata.get("openid") or identity.provider_subject
+        user.wechat_unionid = metadata.get("unionid")
+        user.wechat_bound = identity.verified
+    elif identity.provider == "alipay":
+        user.alipay_bound = identity.verified
+    elif identity.provider == "google":
+        user.google_sub = identity.provider_subject
+
+
+def _clear_legacy_identities(user: User) -> None:
+    user.phone = None
+    user.phone_verified = False
+    user.wechat_openid = None
+    user.wechat_unionid = None
+    user.wechat_bound = False
+    user.alipay_bound = False
+    user.google_sub = None
+
+
 def _issue_tokens(
     db: Session,
     user: User,
@@ -760,13 +1100,72 @@ def _issue_tokens(
     platform: str | None = None,
     device_name: str | None = None,
     suspicious: bool = False,
+    existing_session: DeviceSession | None = None,
+    auth_provider: str = "session",
 ) -> AuthTokensDto:
+    if user.account_status != "normal":
+        if request is not None:
+            _record_login_failure(
+                db,
+                request,
+                provider=auth_provider,
+                failure_code="ACCOUNT_SUSPENDED",
+                subject_hint=user.phone[-4:] if user.phone else user.heishi_id,
+                device_id=device_id,
+                user_id=user.id,
+            )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ACCOUNT_SUSPENDED",
+                "message": "This account is not permitted to sign in",
+                "details": {"accountStatus": user.account_status},
+            },
+        )
     _sync_auth_identities(db, user)
-    access = create_access_token(user.id)
+    if device_id and existing_session is None:
+        existing_session = (
+            db.query(DeviceSession)
+            .filter(
+                DeviceSession.user_id == user.id,
+                DeviceSession.device_id == device_id,
+                DeviceSession.revoked_at.is_(None),
+            )
+            .order_by(DeviceSession.last_seen_at.desc())
+            .first()
+        )
+        if existing_session is None:
+            suspicious = suspicious or (
+                db.query(DeviceSession.id)
+                .filter(DeviceSession.user_id == user.id)
+                .first()
+                is not None
+            )
     refresh = create_refresh_token()
     refresh_record = store_refresh_token(db, user.id, refresh)
-    db.add(
-        DeviceSession(
+    if existing_session:
+        if existing_session.refresh_token_id:
+            previous_refresh = (
+                db.query(RefreshToken)
+                .filter(RefreshToken.id == existing_session.refresh_token_id)
+                .first()
+            )
+            if previous_refresh:
+                previous_refresh.revoked = True
+        existing_session.refresh_token_id = refresh_record.id
+        existing_session.last_seen_at = datetime.now(timezone.utc)
+        existing_session.ip_address = (
+            request.client.host if request and request.client else existing_session.ip_address
+        )
+        existing_session.user_agent = (
+            request.headers.get("user-agent") if request else existing_session.user_agent
+        )
+        existing_session.platform = (platform or existing_session.platform or "unknown").lower()
+        existing_session.device_name = device_name or existing_session.device_name
+        existing_session.suspicious = existing_session.suspicious or suspicious
+        existing_session.revoked_at = None
+    else:
+        session = DeviceSession(
             user_id=user.id,
             refresh_token_id=refresh_record.id,
             device_id=device_id or f"legacy-{secrets.token_urlsafe(18)}",
@@ -776,11 +1175,14 @@ def _issue_tokens(
             user_agent=request.headers.get("user-agent") if request else None,
             suspicious=suspicious,
         )
-    )
+        db.add(session)
+        existing_session = session
+    db.flush()
+    access = create_access_token(user.id, existing_session.id)
     db.add(
         LoginAuditLog(
             user_id=user.id,
-            provider="session",
+            provider=auth_provider,
             subject_hint=user.phone[-4:] if user.phone else user.heishi_id,
             event_type="login_success",
             success=True,
@@ -789,6 +1191,23 @@ def _issue_tokens(
             device_id=device_id,
         )
     )
+    if suspicious:
+        enqueue_notification(
+            db,
+            user_id=user.id,
+            role="buyer",
+            category="account_security",
+            notification_type="suspicious_login",
+            title="New or suspicious sign-in",
+            body="A sign-in that may be unusual was detected. Review your active sessions.",
+            title_zh="检测到新的或可疑的登录",
+            body_zh="检测到可能异常的登录，请检查您的活跃设备会话。",
+            business_type="account",
+            business_id=user.id,
+            deep_link="heymarket://settings/account-safety",
+            deduplication_key=f"security:login:{refresh_record.id}",
+            mandatory=True,
+        )
     db.commit()
     return AuthTokensDto(
         accessToken=access,
@@ -845,7 +1264,8 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
 
     code = generate_code()
     issue_register_code(db, phone, code)
-    print(f"[HeyMarket OTP] register {phone} -> {code}")
+    if settings.expose_dev_otp:
+        print(f"[HeyMarket OTP] register {phone} -> {code}")
 
     return SendRegisterCodeResponse(
         expiresIn=OTP_TTL_SECONDS,
@@ -855,7 +1275,11 @@ def send_register_code(body: SendRegisterCodeRequest, db: Session = Depends(get_
 
 
 @router.post("/register", response_model=AuthTokensDto, status_code=201)
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
+def register(
+    body: RegisterRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     """Legacy register — used when Supabase Auth is not configured on the client."""
     phone = _require_valid_phone(body.phone)
     city = _require_valid_city(body.city)
@@ -923,7 +1347,15 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     issue_welcome_coupon(db, user.id, user.language)
     db.commit()
     db.refresh(user)
-    return _issue_tokens(db, user)
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        device_id=body.deviceId,
+        platform=body.platform,
+        device_name=body.deviceName,
+        auth_provider="phone_register",
+    )
 
 
 @router.post("/login", response_model=AuthTokensDto)
@@ -931,6 +1363,26 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
     phone = _require_valid_phone(body.phone)
     user = db.query(User).filter(User.phone == phone).first()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        ip_failures = (
+            db.query(LoginAuditLog)
+            .filter(
+                LoginAuditLog.ip_address == client_ip,
+                LoginAuditLog.success.is_(False),
+                LoginAuditLog.created_at >= cutoff,
+            )
+            .count()
+        )
+        if ip_failures >= 20:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "LOGIN_IP_RATE_LIMIT",
+                    "message": "Too many failed login attempts from this network. Try again later.",
+                    "details": {"retryAfter": 900},
+                },
+            )
     recent_failures = (
         db.query(LoginAuditLog)
         .filter(
@@ -958,7 +1410,7 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
                 event_type="login_failure",
                 success=False,
                 failure_code="INVALID_CREDENTIALS",
-                ip_address=request.client.host if request.client else None,
+                ip_address=client_ip,
                 user_agent=request.headers.get("user-agent"),
                 device_id=body.deviceId,
             )
@@ -969,19 +1421,41 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
             detail={"code": "INVALID_CREDENTIALS", "message": "Invalid phone or password", "details": {}},
         )
     if user.account_status != "normal":
+        _record_login_failure(
+            db,
+            request,
+            provider="phone_password",
+            failure_code="ACCOUNT_SUSPENDED",
+            subject_hint=phone,
+            device_id=body.deviceId,
+            user_id=user.id,
+        )
         raise HTTPException(
             status_code=403,
             detail={"code": "ACCOUNT_SUSPENDED", "message": "This account is suspended", "details": {}},
         )
-    known_device = False
+    known_session: DeviceSession | None = None
+    has_prior_sessions = False
     if body.deviceId:
-        known_device = (
+        known_session = (
             db.query(DeviceSession)
-            .filter(DeviceSession.user_id == user.id, DeviceSession.device_id == body.deviceId)
+            .filter(
+                DeviceSession.user_id == user.id,
+                DeviceSession.device_id == body.deviceId,
+                DeviceSession.revoked_at.is_(None),
+            )
+            .order_by(DeviceSession.last_seen_at.desc())
+            .first()
+        )
+        has_prior_sessions = (
+            db.query(DeviceSession.id)
+            .filter(DeviceSession.user_id == user.id)
             .first()
             is not None
         )
-    suspicious = recent_failures >= 2 or (bool(body.deviceId) and not known_device and recent_failures > 0)
+    suspicious = recent_failures >= 2 or (
+        bool(body.deviceId) and has_prior_sessions and known_session is None
+    )
     return _issue_tokens(
         db,
         user,
@@ -990,6 +1464,8 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
         platform=body.platform,
         device_name=body.deviceName,
         suspicious=suspicious,
+        existing_session=known_session,
+        auth_provider="phone_password",
     )
 
 
@@ -1035,7 +1511,8 @@ def _send_login_code(db: Session, phone: str) -> SendRegisterCodeResponse:
             )
     code = generate_code()
     issue_login_code(db, phone, code)
-    print(f"[HeyMarket OTP] login {phone} -> {code}")
+    if settings.expose_dev_otp:
+        print(f"[HeyMarket OTP] login {phone} -> {code}")
     return SendRegisterCodeResponse(
         expiresIn=OTP_TTL_SECONDS,
         resendAfter=RESEND_COOLDOWN_SECONDS,
@@ -1065,12 +1542,28 @@ def login_verify(body: LoginOtpRequest, request: Request, db: Session = Depends(
         try:
             verify_sms_code(phone, body.verificationCode.strip())
         except TwilioOtpError as exc:
+            _record_login_failure(
+                db,
+                request,
+                provider="phone",
+                failure_code="OTP_VERIFICATION_FAILED",
+                subject_hint=phone,
+                device_id=body.deviceId,
+            )
             raise _twilio_http_error(exc) from exc
     else:
         try:
             consume_login_code(db, phone, body.verificationCode.strip())
         except ValueError as exc:
             reason = str(exc)
+            _record_login_failure(
+                db,
+                request,
+                provider="phone",
+                failure_code=reason,
+                subject_hint=phone,
+                device_id=body.deviceId,
+            )
             if reason == "OTP_EXPIRED":
                 raise HTTPException(
                     status_code=400,
@@ -1087,14 +1580,50 @@ def login_verify(body: LoginOtpRequest, request: Request, db: Session = Depends(
             ) from exc
     user = db.query(User).filter(User.phone == phone).first()
     if not user:
+        _record_login_failure(
+            db,
+            request,
+            provider="phone",
+            failure_code="ACCOUNT_NOT_FOUND",
+            subject_hint=phone,
+            device_id=body.deviceId,
+        )
         raise HTTPException(
             status_code=404,
             detail={"code": "NOT_FOUND", "message": "No account for this phone number", "details": {}},
         )
     if user.account_status != "normal":
+        _record_login_failure(
+            db,
+            request,
+            provider="phone",
+            failure_code="ACCOUNT_SUSPENDED",
+            subject_hint=phone,
+            device_id=body.deviceId,
+            user_id=user.id,
+        )
         raise HTTPException(
             status_code=403,
             detail={"code": "ACCOUNT_SUSPENDED", "message": "This account is suspended", "details": {}},
+        )
+    existing_session = None
+    has_prior_sessions = False
+    if body.deviceId:
+        existing_session = (
+            db.query(DeviceSession)
+            .filter(
+                DeviceSession.user_id == user.id,
+                DeviceSession.device_id == body.deviceId,
+                DeviceSession.revoked_at.is_(None),
+            )
+            .order_by(DeviceSession.last_seen_at.desc())
+            .first()
+        )
+        has_prior_sessions = (
+            db.query(DeviceSession.id)
+            .filter(DeviceSession.user_id == user.id)
+            .first()
+            is not None
         )
     return _issue_tokens(
         db,
@@ -1103,6 +1632,9 @@ def login_verify(body: LoginOtpRequest, request: Request, db: Session = Depends(
         device_id=body.deviceId,
         platform=body.platform,
         device_name=body.deviceName,
+        suspicious=bool(body.deviceId) and has_prior_sessions and existing_session is None,
+        existing_session=existing_session,
+        auth_provider="phone_otp",
     )
 
 
@@ -1145,14 +1677,42 @@ def logout(user: User = Depends(get_current_user), db: Session = Depends(get_db)
 
 
 @router.post("/refresh", response_model=AuthTokensDto)
-def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
+def refresh(body: RefreshRequest, request: Request, db: Session = Depends(get_db)):
+    old_record = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash == hash_refresh_token(body.refreshToken),
+            RefreshToken.revoked.is_(False),
+        )
+        .with_for_update()
+        .first()
+    )
     user = validate_refresh_token(db, body.refreshToken)
-    if not user:
+    if not user or not old_record:
         raise HTTPException(
             status_code=401,
             detail={"code": "TOKEN_EXPIRED", "message": "Invalid or expired refresh token", "details": {}},
         )
-    return _issue_tokens(db, user)
+    existing_session = (
+        db.query(DeviceSession)
+        .filter(
+            DeviceSession.refresh_token_id == old_record.id,
+            DeviceSession.user_id == user.id,
+            DeviceSession.revoked_at.is_(None),
+        )
+        .first()
+    )
+    # Rotate, never clone. A stolen refresh token cannot be replayed after use,
+    # and the logical device remains one session in the user's security view.
+    old_record.revoked = True
+    db.commit()
+    return _issue_tokens(
+        db,
+        user,
+        request=request,
+        existing_session=existing_session,
+        auth_provider="refresh",
+    )
 
 
 @router.get("/me", response_model=AuthUserDto)
@@ -1235,7 +1795,8 @@ def send_bind_phone_code(
         )
     code = generate_code()
     issue_otp_code(db, phone, "bind_phone", code)
-    print(f"[HeyMarket OTP] bind_phone {phone} -> {code}")
+    if settings.expose_dev_otp:
+        print(f"[HeyMarket OTP] bind_phone {phone} -> {code}")
     return SendRegisterCodeResponse(
         expiresIn=OTP_TTL_SECONDS,
         resendAfter=RESEND_COOLDOWN_SECONDS,
@@ -1371,6 +1932,92 @@ def bind_google_identity(
     return {"bound": True, "provider": "google"}
 
 
+@router.post("/identities/alipay/bind")
+def bind_alipay_identity(
+    body: AlipayAuthRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _validate_alipay_oauth_state(body.oauthState)
+    try:
+        profile = exchange_authorization_code(body.authCode)
+    except AlipayPayoutError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ALIPAY_AUTH_FAILED",
+                "message": str(exc),
+                "details": {},
+            },
+        ) from exc
+    subject = str(profile.get("user_id") or profile.get("open_id") or "").strip()
+    if not subject:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ALIPAY_IDENTITY_MISSING",
+                "message": "Alipay did not return a user identity",
+                "details": {},
+            },
+        )
+    owner = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == "alipay",
+            AuthIdentity.provider_subject == subject,
+        )
+        .first()
+    )
+    if owner and owner.user_id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACCOUNT_MERGE_REQUIRED",
+                "message": "This Alipay identity belongs to another account",
+                "details": {"provider": "alipay"},
+            },
+        )
+    current = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.user_id == user.id,
+            AuthIdentity.provider == "alipay",
+        )
+        .first()
+    )
+    if current and current.provider_subject != subject:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROVIDER_ALREADY_BOUND",
+                "message": "An Alipay identity is already bound to this account",
+                "details": {},
+            },
+        )
+    now = datetime.now(timezone.utc)
+    if not current:
+        current = AuthIdentity(
+            user_id=user.id,
+            provider="alipay",
+            provider_subject=subject,
+            verified=True,
+            metadata_json=json.dumps(
+                {
+                    "userId": profile.get("user_id"),
+                    "openId": profile.get("open_id"),
+                }
+            ),
+            last_used_at=now,
+        )
+        db.add(current)
+    else:
+        current.verified = True
+        current.last_used_at = now
+    user.alipay_bound = True
+    db.commit()
+    return {"bound": True, "provider": "alipay"}
+
+
 @router.post("/account-merge/phone", response_model=AuthTokensDto)
 def merge_phone_account(
     body: MergePhoneAccountRequest,
@@ -1395,7 +2042,7 @@ def merge_phone_account(
             },
         )
     if target.id == user.id:
-        return _issue_tokens(db, user, request=request)
+        return _issue_tokens(db, user, request=request, auth_provider="phone_merge")
     if target.is_admin or user.is_admin:
         raise HTTPException(
             status_code=409,
@@ -1403,6 +2050,15 @@ def merge_phone_account(
                 "code": "MERGE_NOT_ALLOWED",
                 "message": "Administrator accounts cannot be merged",
                 "details": {},
+            },
+        )
+    if target.account_status != "normal":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_ACCOUNT_RESTRICTED",
+                "message": "A restricted account cannot be merged into another account",
+                "details": {"targetStatus": target.account_status},
             },
         )
     has_marketplace_history = any(
@@ -1419,12 +2075,12 @@ def merge_phone_account(
             .first(),
         )
     )
-    if has_marketplace_history:
+    if has_marketplace_history or account_has_cross_domain_state(db, target.id):
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "MERGE_REQUIRES_SUPPORT",
-                "message": "This account has transaction history and requires an administrator-assisted merge",
+                "message": "This account has marketplace or account history and requires an administrator-assisted merge",
                 "details": {},
             },
         )
@@ -1446,17 +2102,170 @@ def merge_phone_account(
                 },
             )
         identity.user_id = user.id
+        _apply_identity_to_legacy_user(user, identity)
         existing_providers.add(identity.provider)
-    user.phone = target.phone
-    user.phone_verified = target.phone_verified
-    target.phone = None
-    target.phone_verified = False
-    target.account_status = "suspended"
+    _clear_legacy_identities(target)
+    target.account_status = "merged"
     target.suspended_at = datetime.now(timezone.utc)
+    target.admin_notes = f"Merged into user {user.id} through phone authorization."
     target.password_hash = hash_password(secrets.token_urlsafe(32))
     revoke_user_refresh_tokens(db, target.id)
     db.commit()
-    return _issue_tokens(db, user, request=request)
+    return _issue_tokens(db, user, request=request, auth_provider="phone_merge")
+
+
+@router.post("/account-merge/identity")
+def merge_third_party_account(
+    body: MergeThirdPartyAccountRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Merge an empty duplicate account after provider authorization proof."""
+    if body.provider == "wechat":
+        profile = _wechat_exchange_code(body.authorizationCode)
+        subject = str(profile.get("unionid") or profile.get("openid") or "")
+    else:
+        try:
+            profile = exchange_authorization_code(body.authorizationCode)
+        except AlipayPayoutError as exc:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "MERGE_AUTHORIZATION_FAILED",
+                    "message": str(exc),
+                    "details": {"provider": body.provider},
+                },
+            ) from exc
+        subject = str(profile.get("user_id") or profile.get("open_id") or "")
+    if not subject:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "MERGE_AUTHORIZATION_FAILED",
+                "message": "The provider did not return an authorized identity",
+                "details": {"provider": body.provider},
+            },
+        )
+    identity = (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == body.provider,
+            AuthIdentity.provider_subject == subject,
+        )
+        .first()
+    )
+    if not identity and body.provider == "wechat":
+        legacy_target = _find_wechat_user(
+            db,
+            str(profile.get("openid") or ""),
+            str(profile.get("unionid") or "") or None,
+        )
+        if legacy_target:
+            _sync_auth_identities(db, legacy_target)
+            db.flush()
+            identity = (
+                db.query(AuthIdentity)
+                .filter(
+                    AuthIdentity.provider == body.provider,
+                    AuthIdentity.provider_subject == subject,
+                )
+                .first()
+            )
+    if not identity:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "MERGE_ACCOUNT_NOT_FOUND",
+                "message": "No account is associated with that authorized identity",
+                "details": {"provider": body.provider},
+            },
+        )
+    target = db.query(User).filter(User.id == identity.user_id).first()
+    if not target or target.id == user.id:
+        return {"merged": False, "provider": body.provider}
+    if target.is_admin or user.is_admin:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_NOT_ALLOWED",
+                "message": "Administrator accounts cannot be merged",
+                "details": {},
+            },
+        )
+    if target.account_status != "normal":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_ACCOUNT_RESTRICTED",
+                "message": "A restricted account cannot be merged into another account",
+                "details": {
+                    "provider": body.provider,
+                    "targetStatus": target.account_status,
+                },
+            },
+        )
+    has_marketplace_history = any(
+        (
+            db.query(Listing.id).filter(Listing.seller_id == target.id).first(),
+            db.query(Order.id)
+            .filter((Order.buyer_id == target.id) | (Order.seller_id == target.id))
+            .first(),
+            db.query(Conversation.id)
+            .filter(
+                (Conversation.buyer_id == target.id)
+                | (Conversation.seller_id == target.id)
+            )
+            .first(),
+        )
+    )
+    if has_marketplace_history or account_has_cross_domain_state(db, target.id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_REQUIRES_SUPPORT",
+                "message": (
+                    "This account has marketplace or account history and requires an "
+                    "administrator-assisted merge"
+                ),
+                "details": {"provider": body.provider},
+            },
+        )
+    _sync_auth_identities(db, target)
+    _sync_auth_identities(db, user)
+    db.flush()
+    existing_by_provider = {
+        row.provider: row
+        for row in db.query(AuthIdentity).filter(AuthIdentity.user_id == user.id).all()
+    }
+    target_identities = (
+        db.query(AuthIdentity).filter(AuthIdentity.user_id == target.id).all()
+    )
+    for target_identity in target_identities:
+        if target_identity.provider in existing_by_provider:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MERGE_IDENTITY_CONFLICT",
+                    "message": (
+                        f"Both accounts already have a "
+                        f"{target_identity.provider} login"
+                    ),
+                    "details": {},
+                },
+            )
+    for target_identity in target_identities:
+        target_identity.user_id = user.id
+        _apply_identity_to_legacy_user(user, target_identity)
+    _clear_legacy_identities(target)
+    target.account_status = "merged"
+    target.suspended_at = datetime.now(timezone.utc)
+    target.admin_notes = (
+        f"Merged into user {user.id} through {body.provider} authorization."
+    )
+    target.password_hash = hash_password(secrets.token_urlsafe(32))
+    revoke_user_refresh_tokens(db, target.id)
+    db.commit()
+    return {"merged": True, "provider": body.provider}
 
 
 @router.delete("/identities/{identity_id}", status_code=204)

@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Order
-from app.notification_jobs import enqueue_notification
+from app.notification_jobs import enqueue_notification, notify_payment_failed
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
-from app.payments.refunds import apply_stripe_refund_update
+from app.payments.refunds import apply_paypal_refund_update, apply_stripe_refund_update
 
 
 def _order_by_psp_payment(db: Session, psp: str, psp_payment_id: str) -> Order | None:
@@ -137,6 +137,34 @@ def handle_stripe_webhook(db: Session, payload: bytes, signature: str | None) ->
             fulfill_paid_order(db, order)
             dispatch_order_paid_push(db, order.id)
             return True
+    if event_type in (
+        "payment_intent.payment_failed",
+        "checkout.session.async_payment_failed",
+        "checkout.session.expired",
+    ):
+        psp_id = data_object.get("payment_intent") or data_object.get("id")
+        order = _order_by_psp_payment(db, "stripe", psp_id) if psp_id else None
+        if not order:
+            meta = data_object.get("metadata") or {}
+            oid = meta.get("order_id") or data_object.get("client_reference_id")
+            if oid:
+                try:
+                    order = _order_by_metadata(db, int(oid))
+                except (TypeError, ValueError):
+                    order = None
+        if order and order.status == "pendingPay":
+            error = data_object.get("last_payment_error") or {}
+            reason = error.get("message") or f"Stripe reported {event_type}"
+            order.payment_status = "failed"
+            order.updated_at = datetime.now(timezone.utc)
+            notify_payment_failed(
+                db,
+                order,
+                reason=str(reason),
+                event_key=str(event.get("id") or event_type),
+            )
+            db.commit()
+        return True
     # A valid Stripe event can legitimately refer to a PaymentIntent that was
     # created outside HeyMarket (for example, `stripe trigger` fixtures). Acknowledge
     # verified but irrelevant events so Stripe does not retry them indefinitely.
@@ -168,6 +196,114 @@ def handle_paypal_webhook(db: Session, payload: dict) -> bool:
             fulfill_paid_order(db, order)
             dispatch_order_paid_push(db, order.id)
             return True
+    if event_type in (
+        "PAYMENT.CAPTURE.DENIED",
+        "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+    ):
+        psp_id = (
+            resource.get("supplementary_data", {})
+            .get("related_ids", {})
+            .get("order_id")
+            or resource.get("id")
+        )
+        order = _order_by_psp_payment(db, "paypal", psp_id) if psp_id else None
+        if order and order.status == "pendingPay":
+            order.payment_status = "failed"
+            order.updated_at = datetime.now(timezone.utc)
+            notify_payment_failed(
+                db,
+                order,
+                reason=resource.get("status_details", {}).get("reason"),
+                event_key=str(payload.get("id") or event_type),
+            )
+            db.commit()
+        return True
+    if event_type in (
+        "PAYMENT.CAPTURE.REFUNDED",
+        "PAYMENT.CAPTURE.REVERSED",
+        "PAYMENT.REFUND.COMPLETED",
+        "PAYMENT.REFUND.FAILED",
+        "PAYMENT.REFUND.PENDING",
+    ):
+        related = resource.get("supplementary_data", {}).get("related_ids", {})
+        capture_id = related.get("capture_id")
+        refund_id = resource.get("id")
+        order = None
+        if refund_id:
+            order = (
+                db.query(Order)
+                .filter(Order.psp == "paypal", Order.refund_reference == refund_id)
+                .first()
+            )
+        if not order and capture_id:
+            order = (
+                db.query(Order)
+                .filter(
+                    Order.psp == "paypal",
+                    Order.psp_transaction_id == capture_id,
+                )
+                .first()
+            )
+        if order:
+            refund_resource = dict(resource)
+            if event_type in {
+                "PAYMENT.CAPTURE.REFUNDED",
+                "PAYMENT.REFUND.COMPLETED",
+            }:
+                refund_resource["status"] = "COMPLETED"
+            elif event_type == "PAYMENT.REFUND.FAILED":
+                refund_resource["status"] = "FAILED"
+            elif event_type == "PAYMENT.REFUND.PENDING":
+                refund_resource["status"] = "PENDING"
+            transition = apply_paypal_refund_update(order, refund_resource)
+            if transition.status == "refunded":
+                order.status = "refunded"
+                order.dispute_status = "resolved"
+                order.payout_paused = False
+            elif transition.status == "pending":
+                order.status = "refundInProgress"
+                order.dispute_status = "refund_pending"
+                order.payout_paused = True
+            else:
+                order.status = "inDispute"
+                order.dispute_status = "refund_failed"
+                order.payout_paused = True
+            enqueue_notification(
+                db,
+                user_id=order.buyer_id,
+                role="buyer",
+                category="refund_update",
+                notification_type=f"refund_{transition.status}",
+                title={
+                    "refunded": "Refund completed",
+                    "pending": "Refund processing",
+                }.get(transition.status, "Refund needs attention"),
+                body={
+                    "refunded": f"Your refund for order #{order.id} is complete.",
+                    "pending": f"Your refund for order #{order.id} is still processing.",
+                }.get(
+                    transition.status,
+                    f"The refund for order #{order.id} could not be completed.",
+                ),
+                title_zh={
+                    "refunded": "退款已完成",
+                    "pending": "退款处理中",
+                }.get(transition.status, "退款处理异常"),
+                body_zh={
+                    "refunded": f"订单 #{order.id} 的退款已完成。",
+                    "pending": f"订单 #{order.id} 的退款仍在处理中。",
+                }.get(transition.status, f"订单 #{order.id} 的退款未能完成。"),
+                business_type="order",
+                business_id=str(order.id),
+                deep_link=f"heymarket://order/{order.id}",
+                deduplication_key=(
+                    f"order:{order.id}:paypal-refund:{transition.status}:"
+                    f"{payload.get('id') or refund_id or 'event'}"
+                ),
+                mandatory=True,
+            )
+            db.commit()
+        return True
     # Signature verification happens at the route boundary. A verified event may
     # legitimately belong to a sandbox fixture or an unrelated PayPal order, so
     # acknowledge it to prevent needless retries.

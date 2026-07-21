@@ -6,7 +6,16 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_accept_language, get_current_user
 from app.coupon_service import refresh_expired_coupons
 from app.database import get_db
-from app.models import Coupon, Favorite, Follow, Listing, User, ViewHistory
+from app.models import (
+    Coupon,
+    Favorite,
+    Follow,
+    FollowedCategory,
+    Listing,
+    User,
+    ViewHistory,
+)
+from app.notification_jobs import notify_seller_interest_milestone
 from app.pagination import paginate
 from app.schemas import CouponDto, FavoriteDto, FollowDto, ListingSummaryDto, Paginated
 from app.serializers import coupon_to_dto, favorite_to_dto, follow_to_dto, iso, listing_to_summary
@@ -64,6 +73,13 @@ def add_favorite(listing_id: int, user: User = Depends(get_current_user), db: Se
     fav = Favorite(user_id=user.id, listing_id=listing_id)
     listing.favorite_count += 1
     db.add(fav)
+    if listing.favorite_count in {3, 5, 10, 25, 50, 100, 250, 500, 1000}:
+        notify_seller_interest_milestone(
+            db,
+            listing,
+            signal="favorites",
+            count=listing.favorite_count,
+        )
     db.commit()
     db.refresh(fav)
     return favorite_to_dto(fav.listing_id, fav.created_at)
@@ -77,6 +93,80 @@ def remove_favorite(listing_id: int, user: User = Depends(get_current_user), db:
         if listing and listing.favorite_count > 0:
             listing.favorite_count -= 1
         db.delete(fav)
+        db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/followed-categories")
+def list_followed_categories(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(FollowedCategory)
+        .filter(FollowedCategory.user_id == user.id)
+        .order_by(FollowedCategory.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "categoryKey": row.category_key,
+            "createdAt": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@router.put("/followed-categories/{category_key}", status_code=204)
+def follow_category(
+    category_key: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    normalized = category_key.strip().lower()
+    if (
+        not normalized
+        or len(normalized) > 50
+        or any(not (character.isalnum() or character in {"-", "_"}) for character in normalized)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_CATEGORY",
+                "message": "Category key is invalid",
+                "details": {},
+            },
+        )
+    exists = (
+        db.query(FollowedCategory.id)
+        .filter(
+            FollowedCategory.user_id == user.id,
+            FollowedCategory.category_key == normalized,
+        )
+        .first()
+    )
+    if not exists:
+        db.add(FollowedCategory(user_id=user.id, category_key=normalized))
+        db.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/followed-categories/{category_key}", status_code=204)
+def unfollow_category(
+    category_key: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(FollowedCategory)
+        .filter(
+            FollowedCategory.user_id == user.id,
+            FollowedCategory.category_key == category_key.strip().lower(),
+        )
+        .first()
+    )
+    if row:
+        db.delete(row)
         db.commit()
     return Response(status_code=204)
 

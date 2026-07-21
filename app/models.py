@@ -186,7 +186,9 @@ class Listing(Base):
     region_city: Mapped[str] = mapped_column(String(50), default="Melbourne")
     region_area: Mapped[str] = mapped_column(String(50), default="Clayton")
     image_url: Mapped[str] = mapped_column(String(500))
+    thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     images_json: Mapped[str] = mapped_column(Text, default="[]")
+    videos_json: Mapped[str] = mapped_column(Text, default="[]")
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     negotiable: Mapped[bool] = mapped_column(Boolean, default=False)
     escrow_supported: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -221,6 +223,18 @@ class Listing(Base):
             self.image_url = value[0]
 
     @property
+    def videos(self) -> list[str]:
+        try:
+            parsed = json.loads(self.videos_json)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, json.JSONDecodeError):
+            return []
+
+    @videos.setter
+    def videos(self, value: list[str]) -> None:
+        self.videos_json = json.dumps(value)
+
+    @property
     def pickup_methods(self) -> list[str]:
         try:
             return json.loads(self.pickup_methods_json)
@@ -248,6 +262,7 @@ class MediaAsset(Base):
     __tablename__ = "media_assets"
     __table_args__ = (
         UniqueConstraint("storage_key", name="uq_media_asset_storage_key"),
+        UniqueConstraint("deduplication_key", name="uq_media_asset_deduplication_key"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -261,16 +276,25 @@ class MediaAsset(Base):
     content_type: Mapped[str] = mapped_column(String(100))
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    deduplication_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     storage_key: Mapped[str] = mapped_column(String(500))
+    source_storage_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     original_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     variants_json: Mapped[str] = mapped_column(Text, default="{}")
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    security_scan_status: Mapped[str] = mapped_column(String(20), default="pending")
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     moderation_status: Mapped[str] = mapped_column(String(30), default="pending")
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    automatic_retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    processing_lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    processing_lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -304,6 +328,9 @@ class Order(Base):
     delivery_method: Mapped[str] = mapped_column(String(50), default="meetup")
     payment_method_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     bundle_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    private_offer_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, unique=True, index=True
+    )
     coupon_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     discount_amount: Mapped[float] = mapped_column(Float, default=0.0)
     payment_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
@@ -374,6 +401,22 @@ class Follow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     follower_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     followed_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FollowedCategory(Base):
+    __tablename__ = "followed_categories"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "category_key",
+            name="uq_followed_categories_user_category",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    category_key: Mapped[str] = mapped_column(String(50), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -596,6 +639,9 @@ class SystemNotification(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     category: Mapped[str] = mapped_column(String(20), default="system", index=True)
+    notification_category: Mapped[str | None] = mapped_column(
+        String(40), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(200))
     title_zh: Mapped[str | None] = mapped_column(String(200), nullable=True)
     body: Mapped[str] = mapped_column(Text)
@@ -649,6 +695,7 @@ class NotificationDispatch(Base):
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -844,6 +891,9 @@ class ShareRecord(Base):
 
 class ShareAttributionEvent(Base):
     __tablename__ = "share_attribution_events"
+    __table_args__ = (
+        UniqueConstraint("deduplication_key", name="uq_share_attribution_event_dedup"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     share_id: Mapped[str] = mapped_column(ForeignKey("share_records.id"), index=True)
@@ -851,6 +901,7 @@ class ShareAttributionEvent(Base):
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String(30), index=True)
     business_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    deduplication_key: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -891,6 +942,20 @@ class DailyActiveUser(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     day: Mapped[str] = mapped_column(String(10), index=True)
     user_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class BackgroundJobLease(Base):
+    """Database-coordinated ownership for scheduler cycles across API workers."""
+
+    __tablename__ = "background_job_leases"
+
+    job_name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(80), index=True)
+    lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class DailyActiveUserHit(Base):

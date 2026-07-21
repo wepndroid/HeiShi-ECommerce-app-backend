@@ -21,6 +21,7 @@ class ProcessedVideo:
     height: int
     thumbnail: bytes
     variants: dict[str, bytes]
+    adaptive_files: dict[str, bytes]
 
 
 def video_processor_available() -> bool:
@@ -94,10 +95,12 @@ def process_video_variants(content: bytes) -> ProcessedVideo:
             ]
         )
         variants: dict[str, bytes] = {}
-        for name, max_height, bitrate in (
-            ("preview", 480, "900k"),
-            ("standard", 720, "1800k"),
-            ("high", 1080, "3500k"),
+        adaptive_files: dict[str, bytes] = {}
+        renditions: list[tuple[str, int, str, int]] = []
+        for name, max_height, bitrate, bandwidth in (
+            ("preview", 480, "900k", 1_100_000),
+            ("standard", 720, "1800k", 2_100_000),
+            ("high", 1080, "3500k", 3_900_000),
         ):
             if name == "high" and height < 900:
                 continue
@@ -126,10 +129,64 @@ def process_video_variants(content: bytes) -> ProcessedVideo:
                 ]
             )
             variants[name] = target.read_bytes()
+            rendition_height = min(max_height, height)
+            rendition_width = max(2, int(width * rendition_height / height) // 2 * 2)
+            renditions.append((name, rendition_height, bitrate, bandwidth))
+
+            # Generate HLS using MPEG-TS segments. The caller stores this whole
+            # directory together, preserving the relative paths used below.
+            playlist = root / f"{name}.m3u8"
+            segment_pattern = root / f"{name}_%03d.ts"
+            _run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-vf",
+                    f"scale=-2:'min({max_height},ih)'",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-b:v",
+                    bitrate,
+                    "-maxrate",
+                    bitrate,
+                    "-bufsize",
+                    str(int(bitrate[:-1]) * 2) + "k",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-hls_time",
+                    "4",
+                    "-hls_playlist_type",
+                    "vod",
+                    "-hls_segment_filename",
+                    str(segment_pattern),
+                    str(playlist),
+                ]
+            )
+            adaptive_files[playlist.name] = playlist.read_bytes()
+            for segment in sorted(root.glob(f"{name}_*.ts")):
+                adaptive_files[segment.name] = segment.read_bytes()
+
+        master_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        for name, rendition_height, _bitrate, bandwidth in renditions:
+            rendition_width = max(2, int(width * rendition_height / height) // 2 * 2)
+            master_lines.extend(
+                [
+                    f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={rendition_width}x{rendition_height}",
+                    f"{name}.m3u8",
+                ]
+            )
+        adaptive_files["master.m3u8"] = ("\n".join(master_lines) + "\n").encode("utf-8")
         return ProcessedVideo(
             duration_seconds=duration,
             width=width,
             height=height,
             thumbnail=thumbnail_path.read_bytes(),
             variants=variants,
+            adaptive_files=adaptive_files,
         )

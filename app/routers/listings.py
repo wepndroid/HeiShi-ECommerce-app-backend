@@ -17,7 +17,9 @@ from app.database import get_db
 from app.messaging_read import bump_unread_for_recipient
 from app.models import Conversation, Favorite, Listing, MediaAsset, Message, Order, User, ViewHistory
 from app.media_processing import MediaValidationError, process_image_variants
+from app.media_security import scan_media_for_threats
 from app.moderation import find_blocked_keyword
+from app.notification_jobs import enqueue_notification, notify_listing_available_again
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
 from app.schemas import CreateListingRequest, ListingDetailDto, ListingSummaryDto, Paginated, UploadImageResponse, BundleItemRequest
@@ -78,7 +80,13 @@ def _build_bundle_meta(body: CreateListingRequest) -> dict:
 router = APIRouter(tags=["listings"])
 upload_router = APIRouter(prefix="/uploads", tags=["uploads"])
 
-OPEN_ORDER_STATUSES = ("pendingPay", "pendingShip", "pendingReceive", "pendingReview")
+OPEN_ORDER_STATUSES = (
+    "pendingPay",
+    "pendingShip",
+    "pendingService",
+    "pendingReceive",
+    "pendingReview",
+)
 
 ALLOWED_TYPES = {
     "image/jpeg",
@@ -145,6 +153,108 @@ def _validate_listing_image_urls(image_urls: list[str]) -> None:
                     "details": {},
                 },
             )
+
+
+def _validate_listing_video_urls(video_urls: list[str]) -> None:
+    if len(video_urls) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": "A listing can contain at most one video",
+                "details": {},
+            },
+        )
+    for url in video_urls:
+        if not _valid_media_url(url):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": "Listing videos must be uploaded http(s) or /uploads/ URLs",
+                    "details": {},
+                },
+            )
+
+
+def _validate_owned_ready_media(
+    db: Session,
+    *,
+    owner_id: str,
+    image_urls: list[str],
+    expected_media_type: str | None = None,
+) -> list[MediaAsset]:
+    """Require every client-supplied listing URL to come from a validated asset."""
+    if not image_urls:
+        return []
+    query = db.query(MediaAsset).filter(
+        MediaAsset.owner_id == owner_id,
+        MediaAsset.status == "READY",
+        MediaAsset.moderation_status == "approved",
+    )
+    if expected_media_type:
+        query = query.filter(MediaAsset.media_type == expected_media_type)
+    assets = query.all()
+    allowed_urls: dict[str, MediaAsset] = {}
+    for asset in assets:
+        if asset.original_url:
+            allowed_urls[asset.original_url] = asset
+        if asset.thumbnail_url:
+            allowed_urls[asset.thumbnail_url] = asset
+        try:
+            variants = json.loads(asset.variants_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            variants = {}
+        if isinstance(variants, dict):
+            for value in variants.values():
+                if value:
+                    allowed_urls[str(value)] = asset
+    unowned = [url for url in image_urls if url not in allowed_urls]
+    if unowned:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "MEDIA_ASSET_NOT_READY",
+                "message": (
+                    "Every listing media file must be uploaded, validated, approved by "
+                    "moderation, and owned by the seller"
+                ),
+                "details": {"unrecognizedCount": len(unowned)},
+            },
+        )
+    unique_assets: dict[str, MediaAsset] = {}
+    for url in image_urls:
+        asset = allowed_urls[url]
+        unique_assets[asset.id] = asset
+    return list(unique_assets.values())
+
+
+def _attach_media_assets(assets: list[MediaAsset], listing_id: int) -> None:
+    """Associate uploaded assets with their listing for moderation traceability."""
+    for asset in assets:
+        if asset.listing_id is None or asset.listing_id == listing_id:
+            asset.listing_id = listing_id
+
+
+def _thumbnail_for_listing_images(
+    image_urls: list[str],
+    assets: list[MediaAsset],
+) -> str | None:
+    """Return the generated thumbnail belonging to the first listing image."""
+    if not image_urls:
+        return None
+    first_url = image_urls[0]
+    for asset in assets:
+        candidate_urls = {asset.original_url, asset.thumbnail_url}
+        try:
+            variants = json.loads(asset.variants_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            variants = {}
+        if isinstance(variants, dict):
+            candidate_urls.update(str(value) for value in variants.values() if value)
+        if first_url in candidate_urls:
+            return asset.thumbnail_url
+    return None
 
 
 def _resolve_upload_content_type(file: UploadFile, content: bytes) -> str | None:
@@ -286,6 +396,7 @@ def create_listing(
     db: Session = Depends(get_db),
 ):
     is_draft = body.status == "draft"
+    validated_assets: list[MediaAsset] = []
     # Admin publish-restriction (限制发布): blocks publishing new listings; drafts still allowed.
     if not is_draft and getattr(user, "publish_restricted", False):
         raise HTTPException(
@@ -300,6 +411,28 @@ def create_listing(
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "At least one image required", "details": {}})
     if body.imageUrls:
         _validate_listing_image_urls(body.imageUrls)
+        all_media_urls = list(body.imageUrls)
+        for bundle_item in body.bundleItems or []:
+            all_media_urls.extend(
+                bundle_item.imageUrls
+                or ([bundle_item.imageUrl] if bundle_item.imageUrl else [])
+            )
+        validated_assets = _validate_owned_ready_media(
+            db,
+            owner_id=user.id,
+            image_urls=all_media_urls,
+            expected_media_type="image",
+        )
+    if body.videoUrls:
+        _validate_listing_video_urls(body.videoUrls)
+        validated_assets.extend(
+            _validate_owned_ready_media(
+                db,
+                owner_id=user.id,
+                image_urls=body.videoUrls,
+                expected_media_type="video",
+            )
+        )
     listing_type = body.type
     if listing_type == "job" and body.merchantPost and not user.business_verified:
         raise HTTPException(
@@ -365,6 +498,11 @@ def create_listing(
         review_note=None,
     )
     listing.images = body.imageUrls
+    listing.thumbnail_url = _thumbnail_for_listing_images(
+        list(body.imageUrls or []),
+        validated_assets,
+    )
+    listing.videos = body.videoUrls or []
     listing.pickup_methods = body.pickupMethods or ["meetup"]
     listing.escrow_supported = True if body.escrowSupported is None else body.escrowSupported
     listing.meet_in_public = True if body.meetInPublic is None else body.meetInPublic
@@ -382,6 +520,7 @@ def create_listing(
         )
     db.add(listing)
     db.flush()
+    _attach_media_assets(validated_assets, listing.id)
     if not is_draft and listing.review_status == "pendingReview":
         notify_admin(
             db,
@@ -409,6 +548,7 @@ class UpdateListingRequest(BaseModel):
     tagKey: str | None = None
     locationLabel: str | None = None
     imageUrls: list[str] | None = None
+    videoUrls: list[str] | None = None
     pickupMethods: list[str] | None = None
     serviceIcon: str | None = None
     escrowSupported: bool | None = None
@@ -433,8 +573,9 @@ def update_listing(
     if listing.status == "sold":
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": "Cannot edit sold listing", "details": {}})
     data = body.model_dump(exclude_unset=True)
+    referenced_assets: dict[str, MediaAsset] = {}
     previous_price = listing.price
-    material_keys = {"title", "description", "price", "imageUrls"} & data.keys()
+    material_keys = {"title", "description", "price", "imageUrls", "videoUrls"} & data.keys()
     if material_keys:
         open_order = (
             db.query(Order)
@@ -467,7 +608,26 @@ def update_listing(
             )
         if key == "imageUrls" and val is not None:
             _validate_listing_image_urls(val)
+            image_assets = _validate_owned_ready_media(
+                db,
+                owner_id=user.id,
+                image_urls=val,
+                expected_media_type="image",
+            )
+            for asset in image_assets:
+                referenced_assets[asset.id] = asset
             listing.images = val
+            listing.thumbnail_url = _thumbnail_for_listing_images(val, image_assets)
+        elif key == "videoUrls" and val is not None:
+            _validate_listing_video_urls(val)
+            for asset in _validate_owned_ready_media(
+                db,
+                owner_id=user.id,
+                image_urls=val,
+                expected_media_type="video",
+            ):
+                referenced_assets[asset.id] = asset
+            listing.videos = val
         elif key == "pickupMethods" and val is not None:
             listing.pickup_methods = val
         elif key == "serviceIcon" and val is not None:
@@ -498,6 +658,19 @@ def update_listing(
                 pickupWindow=data.get("pickupWindow"),
                 pickupMethods=data.get("pickupMethods", listing.pickup_methods),
             )
+            bundle_urls: list[str] = []
+            for bundle_item in val:
+                bundle_urls.extend(
+                    bundle_item.imageUrls
+                    or ([bundle_item.imageUrl] if bundle_item.imageUrl else [])
+                )
+            for asset in _validate_owned_ready_media(
+                db,
+                owner_id=user.id,
+                image_urls=bundle_urls,
+                expected_media_type="image",
+            ):
+                referenced_assets[asset.id] = asset
             listing.bundle_meta = _merge_bundle_meta_for_update(listing, patch)
             if data.get("price") is not None:
                 listing.price = data["price"]
@@ -550,6 +723,32 @@ def update_listing(
             setattr(listing, field_map[key], val)
             if key == "locationLabel" and val is not None:
                 listing.region_area = val
+    if listing.status != "draft":
+        publish_urls = list(listing.images or [])
+        if isinstance(listing.bundle_meta, dict):
+            for item in listing.bundle_meta.get("items") or []:
+                if isinstance(item, dict):
+                    publish_urls.extend(
+                        item.get("imageUrls")
+                        or ([item.get("imageUrl")] if item.get("imageUrl") else [])
+                    )
+        _validate_listing_image_urls(publish_urls)
+        for asset in _validate_owned_ready_media(
+            db,
+            owner_id=user.id,
+            image_urls=publish_urls,
+            expected_media_type="image",
+        ):
+            referenced_assets[asset.id] = asset
+        _validate_listing_video_urls(listing.videos)
+        for asset in _validate_owned_ready_media(
+            db,
+            owner_id=user.id,
+            image_urls=listing.videos,
+            expected_media_type="video",
+        ):
+            referenced_assets[asset.id] = asset
+    _attach_media_assets(list(referenced_assets.values()), listing.id)
     if listing.status != "draft" and (
         content_changed
         or (previous_status == "draft" and listing.status == "active")
@@ -594,6 +793,49 @@ def update_listing(
             db.add(message)
             db.flush()
             bump_unread_for_recipient(db, conversation, user.id)
+        if float(listing.price) < float(previous_price):
+            favorite_user_ids = {
+                favorite_user_id
+                for (favorite_user_id,) in (
+                    db.query(Favorite.user_id)
+                    .filter(
+                        Favorite.listing_id == listing.id,
+                        Favorite.user_id != listing.seller_id,
+                    )
+                    .all()
+                )
+            }
+            price_event = int(now.timestamp())
+            for favorite_user_id in favorite_user_ids:
+                enqueue_notification(
+                    db,
+                    user_id=favorite_user_id,
+                    role="buyer",
+                    category="product_recommendation",
+                    notification_type="favorite_price_reduced",
+                    title="A saved item dropped in price",
+                    body=f"{listing.title[:120]} is now A${float(listing.price):.2f}.",
+                    title_zh="收藏商品降价了",
+                    body_zh=f"“{(listing.title_zh or listing.title)[:120]}”现价 A${float(listing.price):.2f}。",
+                    business_type="listing",
+                    business_id=str(listing.id),
+                    deep_link=f"heymarket://listing/{listing.id}",
+                    deduplication_key=(
+                        f"listing:{listing.id}:price:{float(listing.price):.2f}:"
+                        f"{price_event}:{favorite_user_id}"
+                    ),
+                    mandatory=False,
+                )
+    if (
+        previous_status != "active"
+        and listing.status == "active"
+        and listing.review_status == "approved"
+    ):
+        notify_listing_available_again(
+            db,
+            listing,
+            transition_key=datetime.now(timezone.utc).isoformat(),
+        )
     db.commit()
     db.refresh(listing)
     return listing_to_summary(listing)
@@ -735,6 +977,8 @@ def create_resale(
         status="draft",
     )
     listing.images = source.images
+    listing.thumbnail_url = source.thumbnail_url
+    listing.videos = source.videos
     listing.pickup_methods = source.pickup_methods
     listing.bundle_meta = reset_bundle_meta_for_resale(source.bundle_meta)
     if source.service_icon:
@@ -778,6 +1022,7 @@ async def upload_image(
             variants=variants,
         )
     try:
+        scan_media_for_threats(content)
         processed = process_image_variants(content)
     except MediaValidationError as exc:
         raise HTTPException(
@@ -813,6 +1058,7 @@ async def upload_image(
         variants_json=json.dumps(variant_urls),
         width=processed.width,
         height=processed.height,
+        security_scan_status="passed",
         moderation_status="pending",
     )
     db.add(asset)

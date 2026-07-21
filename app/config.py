@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str = "sqlite:///./heishi.db"
+    app_environment: str = "development"
     jwt_secret: str = "dev-secret-change-in-production"
     jwt_access_expire_seconds: int = 3600
     jwt_refresh_expire_days: int = 30
@@ -19,9 +20,36 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
     supabase_storage_bucket: str = ""
     supabase_storage_path_prefix: str = "uploads"
+    retain_original_media: bool = True
+    # Media threat scanning. ``signature`` performs the built-in file-signature
+    # validation used for local development. Production should use ``clamav``
+    # and point these settings at a private ClamAV daemon; uploads fail closed
+    # when that scanner is unavailable.
+    media_security_scan_mode: str = "signature"
+    clamav_host: str = "127.0.0.1"
+    clamav_port: int = 3310
+    clamav_timeout_seconds: float = 15.0
     escrow_fee: float = 0.0
     aud_to_cny_display_rate: float = 4.75
     pending_pay_expire_minutes: int = 30
+    pending_pay_reminder_minutes: int = 15
+    pending_pay_deadline_reminder_minutes_before: int = 5
+    background_jobs_interval_seconds: int = 60
+    # Automatically suspend a public share token once it reaches an implausibly
+    # high number of resolutions. This limits replay/scraping abuse while keeping
+    # the threshold configurable for campaigns with legitimate high traffic.
+    share_max_access_count: int = 10000
+    # HTTPS origin used for verified product links. Keep blank locally; set to
+    # the production web origin (for example https://market.example.com).
+    public_app_url: str = ""
+    android_app_package: str = "com.heishi.mvp"
+    android_app_sha256_fingerprints: str = ""
+    apple_team_id: str = ""
+    apple_bundle_id: str = "com.heishi.mvp"
+    # App Store destination used by the share landing page. The install button
+    # first copies the structured share command so the privacy-compliant
+    # clipboard entry flow can restore the product after installation.
+    ios_app_store_url: str = ""
     chat_messages: bool = True
     remind_pay: bool = True
     remind_ship: bool = True
@@ -68,6 +96,9 @@ class Settings(BaseSettings):
     alipay_app_id: str = ""
     alipay_private_key: str = ""
     alipay_public_key: str = ""
+    # Registered Alipay OAuth callback. Production should use a verified HTTPS
+    # app-link URL; local native builds may use the application scheme.
+    alipay_oauth_redirect_url: str = "heymarket://auth/alipay"
     # WeChat Open Platform login (not WeChat Pay). The mobile app obtains an
     # authorization code, then the backend exchanges it for openid/unionid.
     wechat_open_app_id: str = ""
@@ -116,6 +147,10 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""
+    # Optional transactional-notification sender. Configure either a Messaging
+    # Service SID or a Twilio phone number; Verify remains dedicated to OTP.
+    twilio_messaging_service_sid: str = ""
+    twilio_from_phone: str = ""
     google_oauth_client_id: str = ""
     google_dev_auth_fallback: bool = False
 
@@ -152,3 +187,30 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_runtime_configuration() -> None:
+    """Fail fast when production would silently disable mandatory safeguards."""
+    if settings.app_environment.strip().lower() != "production":
+        return
+    errors: list[str] = []
+    if settings.jwt_secret == "dev-secret-change-in-production" or len(settings.jwt_secret) < 32:
+        errors.append("JWT_SECRET must be a production secret of at least 32 characters")
+    if settings.media_security_scan_mode.strip().lower() != "clamav":
+        errors.append("MEDIA_SECURITY_SCAN_MODE=clamav is required in production")
+    if settings.storage_backend.strip().lower() != "supabase":
+        errors.append("STORAGE_BACKEND=supabase is required for production media delivery")
+    if not settings.public_app_url.strip().startswith("https://"):
+        errors.append("PUBLIC_APP_URL must be a verified HTTPS origin")
+    if not settings.android_app_sha256_fingerprints.strip():
+        errors.append(
+            "ANDROID_APP_SHA256_FINGERPRINTS is required for verified Android app links"
+        )
+    if not settings.apple_team_id.strip():
+        errors.append("APPLE_TEAM_ID is required for verified iOS universal links")
+    from app.video_processing import video_processor_available
+
+    if not video_processor_available():
+        errors.append("FFmpeg and FFprobe are required for production video processing")
+    if errors:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(errors))

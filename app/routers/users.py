@@ -519,24 +519,34 @@ def bind_verification(
                 "details": {},
             },
         )
-    if body.type == "wechat":
-        user.wechat_bound = True
-    elif body.type == "alipay":
-        user.alipay_bound = True
+    if body.type in ("wechat", "alipay"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "OAUTH_AUTHORIZATION_REQUIRED",
+                "message": (
+                    f"{body.type.capitalize()} must be linked through its authorized "
+                    "identity endpoint; it cannot be enabled manually"
+                ),
+                "details": {
+                    "endpoint": f"/auth/identities/{body.type}/bind",
+                },
+            },
+        )
     else:
         raise HTTPException(
             status_code=400,
             detail={"code": "VALIDATION_ERROR", "message": "Unsupported verification type", "details": {}},
         )
-    db.commit()
-    db.refresh(user)
-    return verification_to_dto(user, submission_status=_verification_submission_status(db, user.id))
 
 
 @router.get("/users/{user_id}/profile", response_model=PublicUserProfileDto)
 def get_public_profile(user_id: str, request: Request, db: Session = Depends(get_db)):
     lang = get_accept_language(request)
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.account_status == "normal",
+    ).first()
     if not user:
         raise HTTPException(
             status_code=404,
@@ -575,7 +585,10 @@ def get_public_listings(
     db: Session = Depends(get_db),
 ):
     lang = get_accept_language(request)
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.account_status == "normal",
+    ).first()
     if not user:
         raise HTTPException(
             status_code=404,

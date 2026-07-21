@@ -12,13 +12,13 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models import RefreshToken, User
+from app.models import DeviceSession, RefreshToken, User
 from app.supabase_auth import decode_supabase_jwt, phone_from_claims
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
 security = HTTPBearer(auto_error=False)
-AU_PHONE_RE = re.compile(r"^(\+?61|0)\d{8,10}$")
+AU_PHONE_RE = re.compile(r"^\+61\d{9}$")
 CN_PHONE_RE = re.compile(r"^\+861[3-9]\d{9}$")
 GLOBAL_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
@@ -36,10 +36,12 @@ def normalize_phone(phone: str) -> str:
             return f"+86{digits}"
     if re.fullmatch(r"1[3-9]\d{9}", cleaned):
         return f"+86{cleaned}"
-    if cleaned.startswith("+61"):
-        return f"0{cleaned[3:]}"
-    if cleaned.startswith("61") and len(cleaned) >= 11:
-        return f"0{cleaned[2:]}"
+    if re.fullmatch(r"\+61\d{9}", cleaned):
+        return cleaned
+    if re.fullmatch(r"61\d{9}", cleaned):
+        return f"+{cleaned}"
+    if re.fullmatch(r"0\d{9}", cleaned):
+        return f"+61{cleaned[1:]}"
     return cleaned
 
 
@@ -47,9 +49,7 @@ def is_valid_phone(phone: str) -> bool:
     normalized = normalize_phone(phone)
     if normalized.startswith("+86"):
         return bool(CN_PHONE_RE.match(normalized))
-    if AU_PHONE_RE.match(normalized):
-        return True
-    return bool(GLOBAL_E164_RE.match(normalized))
+    return bool(AU_PHONE_RE.match(normalized) or GLOBAL_E164_RE.match(normalized))
 
 
 def is_valid_au_phone(phone: str) -> bool:
@@ -71,9 +71,11 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-def create_access_token(user_id: str) -> str:
+def create_access_token(user_id: str, session_id: str | None = None) -> str:
     expire = datetime.now(timezone.utc) + timedelta(seconds=settings.jwt_access_expire_seconds)
     payload = {"sub": user_id, "exp": expire, "type": "access"}
+    if session_id:
+        payload["sid"] = session_id
     return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
 
 
@@ -102,6 +104,17 @@ def revoke_user_refresh_tokens(db: Session, user_id: str) -> None:
     tokens = db.query(RefreshToken).filter(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False)).all()
     for t in tokens:
         t.revoked = True
+    # Session rows are the user-visible representation of those refresh
+    # credentials. Keep them synchronized so logout, password changes, account
+    # suspension, and merges cannot leave a revoked device shown as active.
+    now = datetime.now(timezone.utc)
+    sessions = (
+        db.query(DeviceSession)
+        .filter(DeviceSession.user_id == user_id, DeviceSession.revoked_at.is_(None))
+        .all()
+    )
+    for session in sessions:
+        session.revoked_at = now
     db.commit()
 
 
@@ -133,8 +146,21 @@ def _user_from_legacy_token(token: str, db: Session) -> User | None:
         user_id = payload.get("sub")
         if not user_id:
             return None
+        session_id = payload.get("sid")
     except JWTError:
         return None
+    if session_id:
+        active_session = (
+            db.query(DeviceSession.id)
+            .filter(
+                DeviceSession.id == session_id,
+                DeviceSession.user_id == user_id,
+                DeviceSession.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if not active_session:
+            return None
     return db.query(User).filter(User.id == user_id).first()
 
 

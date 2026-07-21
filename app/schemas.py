@@ -28,6 +28,9 @@ class RegisterRequest(BaseModel):
     verificationCode: str = Field(min_length=6, max_length=6)
     city: str = Field(min_length=1, max_length=100)
     avatarUrl: str | None = Field(default=None, min_length=1, max_length=500)
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
 
 
 class SendRegisterCodeRequest(BaseModel):
@@ -116,6 +119,26 @@ class WeChatAuthRequest(BaseModel):
     code: str = Field(min_length=1, max_length=512)
     nickname: str | None = Field(default=None, min_length=1, max_length=50)
     city: str | None = Field(default=None, min_length=1, max_length=100)
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
+
+
+class AlipayAuthRequest(BaseModel):
+    """Alipay OAuth authorization returned by the native or web client."""
+
+    authCode: str = Field(min_length=1, max_length=2048)
+    oauthState: str | None = Field(default=None, min_length=20, max_length=512)
+    nickname: str | None = Field(default=None, min_length=1, max_length=50)
+    city: str | None = Field(default=None, min_length=1, max_length=100)
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
+
+
+class MergeThirdPartyAccountRequest(BaseModel):
+    provider: Literal["wechat", "alipay"]
+    authorizationCode: str = Field(min_length=1, max_length=2048)
 
 
 class GoogleAuthRequest(BaseModel):
@@ -124,6 +147,9 @@ class GoogleAuthRequest(BaseModel):
     idToken: str = Field(min_length=1, max_length=4096)
     nickname: str | None = Field(default=None, min_length=1, max_length=50)
     city: str | None = Field(default=None, min_length=1, max_length=100)
+    deviceId: str | None = Field(default=None, max_length=255)
+    platform: str | None = Field(default=None, max_length=20)
+    deviceName: str | None = Field(default=None, max_length=120)
 
 
 class GoogleDevAuthRequest(BaseModel):
@@ -157,6 +183,7 @@ class ListingSummaryDto(BaseModel):
     locationLabel: str
     imageUrl: str
     images: list[str] = Field(default_factory=list)
+    videos: list[str] = Field(default_factory=list)
     seller: SellerDto
     status: Literal["active", "draft", "sold", "inactive"]
     reviewStatus: Literal["pendingReview", "approved", "rejected", "removed", "draft"] = "approved"
@@ -169,6 +196,7 @@ class ListingSummaryDto(BaseModel):
 
 class ListingDetailDto(ListingSummaryDto):
     images: list[str]
+    videos: list[str] = Field(default_factory=list)
     conditionKey: str | None = None
     negotiable: bool | None = None
     escrowSupported: bool | None = None
@@ -204,6 +232,7 @@ class CreateListingRequest(BaseModel):
     regionState: str | None = None
     regionCity: str | None = None
     imageUrls: list[str]
+    videoUrls: list[str] | None = None
     pickupMethods: list[str] | None = None
     bundleItems: list[BundleItemRequest] | None = None
     merchantPost: bool | None = False
@@ -262,6 +291,7 @@ class CreateOrderRequest(BaseModel):
     deliveryMethod: str
     paymentMethodId: str | None = None
     bundleItemId: str | None = None
+    privateOfferId: str | None = None
     couponId: str | None = None
 
 
@@ -418,9 +448,21 @@ class SendMessageRequest(BaseModel):
 
 class SystemNotificationDto(BaseModel):
     id: str
+    notificationId: str
+    userId: str
+    userRoleContext: str | None = None
+    notificationCategory: str
+    notificationType: str | None = None
     title: str
     body: str
+    content: str
+    businessType: str | None = None
+    businessId: str | None = None
+    deepLink: str | None = None
+    pushStatus: str
+    readStatus: Literal["read", "unread"]
     createdAt: str
+    readAt: str | None = None
     unread: bool | None = None
 
 
@@ -429,10 +471,22 @@ NotificationCategory = Literal["system", "order", "follow"]
 
 class InboxNotificationDto(BaseModel):
     id: str
+    notificationId: str
+    userId: str
+    userRoleContext: str | None = None
+    notificationCategory: str
+    notificationType: str | None = None
     category: NotificationCategory
     title: str
     body: str
+    content: str
+    businessType: str | None = None
+    businessId: str | None = None
+    deepLink: str | None = None
+    pushStatus: str
+    readStatus: Literal["read", "unread"]
     createdAt: str
+    readAt: str | None = None
     unread: bool
     actionType: str | None = None
     actionRef: str | None = None

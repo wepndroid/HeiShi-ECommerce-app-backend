@@ -163,6 +163,17 @@ def listing_description(listing: Listing, lang: str = "en") -> str | None:
     return desc or None
 
 
+def listing_card_image_url(listing: Listing) -> str:
+    """Use the optimized thumbnail for compact surfaces, never detail media."""
+    thumbnail = normalize_media_url(getattr(listing, "thumbnail_url", None))
+    if thumbnail:
+        return thumbnail
+    images = normalize_media_urls(listing.images)
+    if images:
+        return images[0]
+    return normalize_media_url(listing.image_url) or ""
+
+
 def listing_to_summary(
     listing: Listing,
     lang: str = "en",
@@ -174,7 +185,8 @@ def listing_to_summary(
     status = listing.status if listing.status in ("active", "draft", "sold", "inactive") else "active"
     review_status = listing.review_status if listing.review_status in ("pendingReview", "approved", "rejected", "removed", "draft") else "approved"
     images = normalize_media_urls(listing.images)
-    cover = images[0] if images else normalize_media_url(listing.image_url)
+    videos = normalize_media_urls(listing.videos)
+    cover = listing_card_image_url(listing)
     return ListingSummaryDto(
         id=listing.id,
         type=listing_type,
@@ -186,6 +198,7 @@ def listing_to_summary(
         locationLabel=listing.location_label,
         imageUrl=cover or "",
         images=images,
+        videos=videos,
         seller=seller_to_dto(
             listing.seller,
             lang,
@@ -261,7 +274,7 @@ def listing_to_detail(listing: Listing, lang: str = "en", *, escrow_fee: float =
 
 def listing_to_service(listing: Listing, lang: str = "en") -> LocalServiceDto:
     icon = listing.service_icon if listing.service_icon in ("truck", "broom", "cameraService") else "truck"
-    cover = normalize_media_url(listing.image_url)
+    cover = listing_card_image_url(listing)
     return LocalServiceDto(
         id=listing.id,
         title=listing_title(listing, lang),
@@ -298,7 +311,7 @@ def order_to_dto(
         id=order.id,
         listingId=order.listing_id,
         listingTitle=listing_title(order.listing, lang),
-        listingImageUrl=normalize_media_url(order.listing.image_url) or "",
+        listingImageUrl=listing_card_image_url(order.listing),
         seller=seller_to_dto(order.seller, lang),
         buyer=buyer,
         status=status,
@@ -308,6 +321,7 @@ def order_to_dto(
         deliveryMethod=order.delivery_method,
         paymentMethodId=order.payment_method_id,
         bundleItemId=order.bundle_item_id,
+        privateOfferId=order.private_offer_id,
         couponId=order.coupon_id,
         discountAmount=order.discount_amount if order.discount_amount else None,
         createdAt=iso(order.created_at),
@@ -351,7 +365,7 @@ def conversation_to_dto(conv: Conversation, current_user_id: str, lang: str = "e
     last_msg = None
     if conv.last_message_text and conv.last_message_at:
         last_msg = LastMessageDto(text=conv.last_message_text, sentAt=iso(conv.last_message_at))
-    listing_cover = normalize_media_url(conv.listing.image_url)
+    listing_cover = listing_card_image_url(conv.listing)
     listing_ref = ListingRefDto(
         id=conv.listing.id,
         title=listing_title(conv.listing, lang),
@@ -562,7 +576,7 @@ def received_review_to_dto(
         criteria=_review_criteria_dto(review),
         createdAt=iso(review.created_at),
         listingTitle=listing.title,
-        listingImageUrl=normalize_media_url(listing.image_url) or "",
+        listingImageUrl=listing_card_image_url(listing),
         listingId=listing.id,
         reviewerNickname=reviewer.nickname,
         reviewerRole=reviewer_role,
@@ -580,7 +594,7 @@ def pending_review_order_to_dto(
         orderId=order.id,
         listingId=order.listing_id,
         listingTitle=listing_title(order.listing, lang),
-        listingImageUrl=normalize_media_url(order.listing.image_url) or "",
+        listingImageUrl=listing_card_image_url(order.listing),
         amount=order.amount,
         counterpartNickname=counterpart_nickname,
         reviewRole=review_role,
@@ -590,9 +604,21 @@ def pending_review_order_to_dto(
 def system_notification_to_dto(n: SystemNotification) -> SystemNotificationDto:
     return SystemNotificationDto(
         id=n.id,
+        notificationId=n.id,
+        userId=n.user_id,
+        userRoleContext=n.user_role_context,
+        notificationCategory=n.notification_category or n.category,
+        notificationType=n.notification_type,
         title=n.title,
         body=n.body,
+        content=n.body,
+        businessType=n.business_type,
+        businessId=n.business_id,
+        deepLink=n.deep_link,
+        pushStatus=n.push_status,
+        readStatus="unread" if n.unread else "read",
         createdAt=iso(n.created_at),
+        readAt=iso(n.read_at) if n.read_at else None,
         unread=n.unread,
     )
 
@@ -603,10 +629,22 @@ def inbox_notification_to_dto(n: SystemNotification, lang: str = "en") -> InboxN
     category = n.category if n.category in ("system", "order", "follow") else "system"
     return InboxNotificationDto(
         id=n.id,
+        notificationId=n.id,
+        userId=n.user_id,
+        userRoleContext=n.user_role_context,
+        notificationCategory=n.notification_category or n.category,
+        notificationType=n.notification_type,
         category=category,
         title=title,
         body=body,
+        content=body,
+        businessType=n.business_type,
+        businessId=n.business_id,
+        deepLink=n.deep_link,
+        pushStatus=n.push_status,
+        readStatus="unread" if n.unread else "read",
         createdAt=iso(n.created_at),
+        readAt=iso(n.read_at) if n.read_at else None,
         unread=bool(n.unread),
         actionType=n.action_type,
         actionRef=n.action_ref,

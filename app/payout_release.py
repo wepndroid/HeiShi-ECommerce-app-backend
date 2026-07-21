@@ -16,6 +16,7 @@ from app import (
 )
 from app.config import settings
 from app.models import Order, PayoutMethod, User
+from app.notification_jobs import notify_payout_transition
 from app.payments.service import amount_to_minor
 
 PAYOUT_PENDING = "pending"
@@ -394,7 +395,7 @@ def _release_wechat_payout(order: Order, payout_method: PayoutMethod, amount_min
     return _apply_wechat_status(order, payout_method, payload)
 
 
-def release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
+def _release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
     """Attempt to release seller funds to the seller's configured payout destination."""
     if getattr(order, "refund_status", None) == "pending":
         return _set_blocked(order, "REFUND_PENDING", "Payout is blocked while the buyer refund is pending")
@@ -445,6 +446,30 @@ def release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
         return _release_wechat_payout(order, payout_method, amount_minor)
 
     return _set_blocked(order, "PAYOUT_METHOD_UNSUPPORTED", "Seller payout method is not supported")
+
+
+def release_payout_for_order(db: Session, order: Order) -> PayoutTransition:
+    """Release or synchronize seller funds and notify every durable transition."""
+    previous = (
+        order.payout_status,
+        order.payout_reference,
+        order.payout_failure_code,
+    )
+    transition = _release_payout_for_order(db, order)
+    current = (
+        order.payout_status,
+        order.payout_reference,
+        order.payout_failure_code,
+    )
+    if transition.changed and current != previous:
+        notify_payout_transition(
+            db,
+            order,
+            status=transition.status,
+            reference=transition.reference,
+            reason=transition.reason,
+        )
+    return transition
 
 
 def reverse_released_payout_for_order(order: Order) -> PayoutTransition:

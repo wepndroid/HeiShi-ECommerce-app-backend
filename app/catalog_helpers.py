@@ -1,9 +1,24 @@
 from datetime import datetime, timedelta, timezone
+import json
 
-from sqlalchemy import and_, exists, func, or_, select
-from sqlalchemy.orm import Query, Session
+from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy.orm import Query, Session, aliased
 
-from app.models import Conversation, ExposureRule, Listing, Order, Review
+from app.models import (
+    Conversation,
+    ExposureRule,
+    Favorite,
+    Follow,
+    FollowedCategory,
+    Listing,
+    Message,
+    Order,
+    PrivateOffer,
+    PromotionClickEvent,
+    Review,
+    User,
+    ViewHistory,
+)
 
 PENDING_PAY_STATUS = "pendingPay"
 
@@ -82,20 +97,27 @@ def apply_tab_filter(q: Query, tab: str | None) -> Query:
     return q
 
 
-def apply_feed_sort(q: Query) -> Query:
+def apply_feed_sort(
+    q: Query,
+    viewer_user_id: str | None = None,
+    viewer_city: str | None = None,
+) -> Query:
     """Apply active admin exposure rules, then the normal organic ranking.
 
     A correlated subquery avoids duplicate listings when more than one rule targets
     the same product. Suppression is server-enforced and expired rules have no effect.
     """
     now = datetime.now(timezone.utc)
-    target_matches = and_(
+    target_region_matches = (
         or_(
             ExposureRule.target_region.is_(None),
-            ExposureRule.target_region == Listing.region_state,
-            ExposureRule.target_region == Listing.region_city,
-            ExposureRule.target_region == Listing.region_area,
-        ),
+            ExposureRule.target_region == viewer_city,
+        )
+        if viewer_city
+        else ExposureRule.target_region.is_(None)
+    )
+    target_matches = and_(
+        target_region_matches,
         or_(
             ExposureRule.target_category.is_(None),
             ExposureRule.target_category == Listing.category_key,
@@ -108,18 +130,27 @@ def apply_feed_sort(q: Query) -> Query:
         or_(ExposureRule.end_time.is_(None), ExposureRule.end_time > now),
         target_matches,
     )
-    suppressed = exists(
+    excluded = exists(
         select(ExposureRule.id).where(
             active_rule,
-            ExposureRule.rule_type.in_(("suppress", "exclude")),
+            ExposureRule.rule_type == "exclude",
         )
     )
     pinned = exists(
         select(ExposureRule.id).where(active_rule, ExposureRule.rule_type == "pin")
     )
-    exposure_weight = (
+    positive_weight = (
         select(func.max(ExposureRule.exposure_weight))
-        .where(active_rule, ExposureRule.rule_type != "suppress")
+        .where(
+            active_rule,
+            ExposureRule.rule_type.in_(("boost", "pin", "regional", "category")),
+        )
+        .correlate(Listing)
+        .scalar_subquery()
+    )
+    suppress_weight = (
+        select(func.min(ExposureRule.exposure_weight))
+        .where(active_rule, ExposureRule.rule_type == "suppress")
         .correlate(Listing)
         .scalar_subquery()
     )
@@ -135,6 +166,12 @@ def apply_feed_sort(q: Query) -> Query:
         .correlate(Listing)
         .scalar_subquery()
     )
+    promotion_click_count = (
+        select(func.count(PromotionClickEvent.id))
+        .where(PromotionClickEvent.listing_id == Listing.id)
+        .correlate(Listing)
+        .scalar_subquery()
+    )
     seller_rating = (
         select(func.avg(Review.rating))
         .join(Order, Review.order_id == Order.id)
@@ -142,21 +179,202 @@ def apply_feed_sort(q: Query) -> Query:
         .correlate(Listing)
         .scalar_subquery()
     )
-    organic_score = (
-        func.coalesce(Listing.favorite_count, 0) * 0.25
-        + func.coalesce(Listing.view_count, 0) * 0.01
-        + func.coalesce(conversation_count, 0) * 0.2
-        + func.coalesce(completed_order_count, 0) * 1.0
-        + func.coalesce(seller_rating, 0) * 0.1
+    interest_score = 0.0
+    if viewer_user_id:
+        favorite_listing = aliased(Listing)
+        viewed_listing = aliased(Listing)
+        ordered_listing = aliased(Listing)
+        conversation_listing = aliased(Listing)
+        interest_score = (
+            case(
+                (
+                    exists(
+                        select(Favorite.id)
+                        .join(
+                            favorite_listing,
+                            Favorite.listing_id == favorite_listing.id,
+                        )
+                        .where(
+                            Favorite.user_id == viewer_user_id,
+                            favorite_listing.category_key == Listing.category_key,
+                        )
+                    ),
+                    1.5,
+                ),
+                else_=0.0,
+            )
+            + case(
+                (
+                    exists(
+                        select(ViewHistory.id)
+                        .join(
+                            viewed_listing,
+                            ViewHistory.listing_id == viewed_listing.id,
+                        )
+                        .where(
+                            ViewHistory.user_id == viewer_user_id,
+                            viewed_listing.category_key == Listing.category_key,
+                        )
+                    ),
+                    1.0,
+                ),
+                else_=0.0,
+            )
+            + case(
+                (
+                    exists(
+                        select(Order.id)
+                        .join(
+                            ordered_listing,
+                            Order.listing_id == ordered_listing.id,
+                        )
+                        .where(
+                            Order.buyer_id == viewer_user_id,
+                            ordered_listing.category_key == Listing.category_key,
+                            Order.status.in_(
+                                (
+                                    "pendingShip",
+                                    "pendingService",
+                                    "pendingReceive",
+                                    "pendingReview",
+                                    "completed",
+                                )
+                            ),
+                        )
+                    ),
+                    2.0,
+                ),
+                else_=0.0,
+            )
+            + case(
+                (
+                    exists(
+                        select(Conversation.id)
+                        .join(
+                            conversation_listing,
+                            Conversation.listing_id == conversation_listing.id,
+                        )
+                        .where(
+                            Conversation.buyer_id == viewer_user_id,
+                            conversation_listing.category_key
+                            == Listing.category_key,
+                        )
+                    ),
+                    1.0,
+                ),
+                else_=0.0,
+            )
+            + case(
+                (
+                    exists(
+                        select(Follow.id).where(
+                            Follow.follower_id == viewer_user_id,
+                            Follow.followed_id == Listing.seller_id,
+                        )
+                    ),
+                    2.0,
+                ),
+                else_=0.0,
+            )
+            + case(
+                (
+                    exists(
+                        select(FollowedCategory.id).where(
+                            FollowedCategory.user_id == viewer_user_id,
+                            FollowedCategory.category_key == Listing.category_key,
+                        )
+                    ),
+                    2.0,
+                ),
+                else_=0.0,
+            )
+        )
+    geographic_score = (
+        case((Listing.region_city == viewer_city, 1.25), else_=0.0)
+        if viewer_city
+        else 0.0
     )
-    q = q.filter(~suppressed)
+    product_quality_score = (
+        case((Listing.thumbnail_url.is_not(None), 0.25), else_=0.0)
+        + case((Listing.description.is_not(None), 0.15), else_=0.0)
+    )
+    view_denominator = func.coalesce(Listing.view_count, 0) + 1.0
+    conversation_denominator = func.coalesce(conversation_count, 0) + 1.0
+    organic_score = (
+        # Use rates as quality signals so a high-volume listing does not rank
+        # solely because it has existed longer. Raw activity remains a small
+        # confidence signal for brand-new listings.
+        (
+            func.coalesce(Listing.favorite_count, 0)
+            / view_denominator
+        )
+        * 2.0
+        + (
+            func.coalesce(conversation_count, 0)
+            / view_denominator
+        )
+        * 2.0
+        + (
+            func.coalesce(completed_order_count, 0)
+            / conversation_denominator
+        )
+        * 3.0
+        + func.coalesce(Listing.view_count, 0) * 0.002
+        + func.coalesce(seller_rating, 0) * 0.1
+        # Promotion clicks divided by views provide a bounded click-through
+        # quality signal. The +1 avoids division by zero for new listings.
+        + (
+            func.coalesce(promotion_click_count, 0)
+            / view_denominator
+        )
+        * 0.5
+        + interest_score
+        + geographic_score
+        + product_quality_score
+    )
+    # ``exclude`` removes a product. ``suppress`` only reduces its ranking and
+    # therefore must remain visible, which is materially different behavior.
+    q = q.filter(~excluded)
     return q.order_by(
         pinned.desc(),
-        func.coalesce(exposure_weight, 1.0).desc(),
+        func.coalesce(suppress_weight, positive_weight, 1.0).desc(),
         Listing.is_pinned.desc(),
         Listing.is_recommended.desc(),
         organic_score.desc(),
         Listing.created_at.desc(),
+    )
+
+
+def listing_excluded_from_recommendations(
+    db: Session,
+    listing: Listing,
+    viewer_region: str | None = None,
+) -> bool:
+    """Apply active recommendation exclusions outside SQL feed queries too."""
+    now = datetime.now(timezone.utc)
+    return (
+        db.query(ExposureRule.id)
+        .filter(
+            ExposureRule.product_id == listing.id,
+            ExposureRule.rule_type == "exclude",
+            ExposureRule.status == "active",
+            or_(ExposureRule.start_time.is_(None), ExposureRule.start_time <= now),
+            or_(ExposureRule.end_time.is_(None), ExposureRule.end_time > now),
+            (
+                or_(
+                    ExposureRule.target_region.is_(None),
+                    ExposureRule.target_region == viewer_region,
+                )
+                if viewer_region
+                else ExposureRule.target_region.is_(None)
+            ),
+            or_(
+                ExposureRule.target_category.is_(None),
+                ExposureRule.target_category == listing.category_key,
+            ),
+        )
+        .first()
+        is not None
     )
 
 
@@ -173,12 +391,20 @@ def apply_feed_listing_status_filter(q: Query, db: Session, user_id: str | None)
     Search, Related, or category feeds merely because the viewer participated in an order
     or owns the listing.
     """
-    return q.filter(Listing.status == "active", Listing.review_status == "approved")
+    return q.filter(
+        Listing.status == "active",
+        Listing.review_status == "approved",
+        Listing.seller.has(User.account_status == "normal"),
+    )
 
 
 def apply_public_listing_visibility_filter(q: Query) -> Query:
     """Public seller/profile pages and direct public detail views."""
-    return q.filter(Listing.status == "active", Listing.review_status == "approved")
+    return q.filter(
+        Listing.status == "active",
+        Listing.review_status == "approved",
+        Listing.seller.has(User.account_status == "normal"),
+    )
 
 
 def apply_search(q: Query, q_text: str | None, sort: str | None) -> Query:
@@ -346,9 +572,77 @@ def expire_stale_pending_pay_orders(db: Session, ttl_minutes: int = 30) -> None:
     now = datetime.now(timezone.utc)
     for order in stale:
         release_order_bundle_hold(db, order)
+        if order.private_offer_id:
+            offer = db.query(PrivateOffer).filter(PrivateOffer.id == order.private_offer_id).first()
+            if offer and offer.status == "CONVERTED_TO_ORDER":
+                offer.status = "EXPIRED"
+                offer.cancelled_at = now
+                messages = (
+                    db.query(Message)
+                    .filter(
+                        Message.conversation_id == offer.conversation_id,
+                        Message.message_type == "private_offer",
+                    )
+                    .all()
+                )
+                for message in messages:
+                    try:
+                        payload = json.loads(message.structured_payload_json or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if payload.get("id") != offer.id:
+                        continue
+                    payload["status"] = "EXPIRED"
+                    payload["cancelledAt"] = now.isoformat()
+                    message.structured_payload_json = json.dumps(payload)
         order.status = "cancelled"
         order.updated_at = now
     db.commit()
+
+
+def invalidate_other_private_offers(
+    db: Session,
+    *,
+    listing_id: int,
+    accepted_offer_id: str | None,
+) -> None:
+    """Invalidate remaining buyer-specific offers after inventory is paid."""
+    offers = (
+        db.query(PrivateOffer)
+        .filter(
+            PrivateOffer.product_id == listing_id,
+            PrivateOffer.status.in_(("PENDING", "VIEWED")),
+        )
+        .all()
+    )
+    if not offers:
+        return
+    offer_ids = {offer.id for offer in offers if offer.id != accepted_offer_id}
+    for offer in offers:
+        if offer.id in offer_ids:
+            offer.status = "INVALIDATED"
+            offer.cancelled_at = datetime.now(timezone.utc)
+    if not offer_ids:
+        return
+    conversation_ids = {offer.conversation_id for offer in offers if offer.id in offer_ids}
+    messages = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id.in_(conversation_ids),
+            Message.message_type == "private_offer",
+        )
+        .all()
+    )
+    for message in messages:
+        try:
+            payload = json.loads(message.structured_payload_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if payload.get("id") not in offer_ids:
+            continue
+        payload["status"] = "INVALIDATED"
+        payload["cancelledAt"] = datetime.now(timezone.utc).isoformat()
+        message.structured_payload_json = json.dumps(payload)
 
 
 def listing_has_pending_pay(db: Session, listing_id: int) -> bool:

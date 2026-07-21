@@ -27,11 +27,13 @@ from app.config import settings
 from app.database import get_db
 
 from app.models import Listing, Order, User
+from app.catalog_helpers import listing_checkout_amount
 from app.payments.paypal_adapter import PayPalAdapter
 
 from app.payments.service import apply_checkout_to_order, start_checkout
 
 from app.payments.webhooks import handle_paypal_webhook, handle_stripe_webhook
+from app.notification_jobs import notify_payment_failed
 
 
 
@@ -129,6 +131,11 @@ def create_checkout(
         from app.catalog_helpers import bundle_item_is_available, find_bundle_item
 
         listing_available = bundle_item_is_available(find_bundle_item(listing, order.bundle_item_id) or {})
+    elif listing_available and listing.type == "bundle" and not order.private_offer_id:
+        locked_base = round(float(order.amount or 0) + float(order.discount_amount or 0), 2)
+        listing_available = (
+            abs(round(listing_checkout_amount(listing), 2) - locked_base) <= 0.01
+        )
     if not listing_available:
         order.status = "cancelled"
         db.commit()
@@ -152,6 +159,15 @@ def create_checkout(
         )
 
     except RuntimeError as exc:
+        order.payment_status = "failed"
+        order.updated_at = datetime.now(timezone.utc)
+        notify_payment_failed(
+            db,
+            order,
+            reason=str(exc),
+            event_key="checkout-create",
+        )
+        db.commit()
 
         raise HTTPException(
 
@@ -292,6 +308,15 @@ def paypal_return(orderId: int, db: Session = Depends(get_db)):
             )
 
         except RuntimeError as exc:
+            order.payment_status = "failed"
+            order.updated_at = datetime.now(timezone.utc)
+            notify_payment_failed(
+                db,
+                order,
+                reason=str(exc),
+                event_key="paypal-capture",
+            )
+            db.commit()
 
             raise HTTPException(
 

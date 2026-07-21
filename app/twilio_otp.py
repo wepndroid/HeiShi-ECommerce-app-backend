@@ -17,7 +17,7 @@ def _clean_phone(phone: str) -> str:
 
 
 def to_e164_phone(phone: str) -> str:
-    """Convert the app's normalized AU/CN phone formats to Twilio-friendly E.164."""
+    """Convert canonical or legacy AU/CN phone formats to Twilio E.164."""
     cleaned = _clean_phone(phone)
     if cleaned.startswith("+61"):
         return cleaned

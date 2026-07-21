@@ -112,6 +112,24 @@ def apply_stripe_refund_update(order: Order, refund: dict) -> RefundTransition:
     return _set_pending(order, reference)
 
 
+def apply_paypal_refund_update(order: Order, refund: dict) -> RefundTransition:
+    """Apply PayPal's synchronous or asynchronous refund state."""
+    reference = refund.get("id") or order.refund_reference
+    status = str(refund.get("status") or "").upper()
+    if status == "COMPLETED":
+        return _set_refunded(order, reference)
+    if status in {"FAILED", "CANCELLED", "CANCELED"}:
+        details = refund.get("status_details") or {}
+        reason = details.get("reason") or f"PayPal refund {status.lower()}"
+        return _set_failed(
+            "PAYPAL_REFUND_FAILED",
+            str(reason),
+            order=order,
+            reference=reference,
+        )
+    return _set_pending(order, reference)
+
+
 def refund_order_payment(order: Order) -> RefundTransition:
     current = (order.payment_status or "").lower()
     if current == "refunded" or order.refund_status == "succeeded":
@@ -154,6 +172,6 @@ def refund_order_payment(order: Order) -> RefundTransition:
             )
         except Exception as exc:
             return _set_failed("PAYPAL_REFUND_FAILED", str(exc))
-        return _set_refunded(order, refund.get("id"))
+        return apply_paypal_refund_update(order, refund)
 
     return _set_failed("PSP_UNSUPPORTED", "Automatic buyer refunds are not implemented for this provider")

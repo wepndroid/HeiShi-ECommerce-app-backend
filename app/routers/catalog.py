@@ -23,7 +23,7 @@ from app.database import get_db
 from app.form_options import LISTING_FORM_OPTIONS
 from app.image_search import hamming_distance, hash_image_bytes, hash_image_url, is_similar_enough
 from app.media_urls import normalize_media_url, normalize_media_urls
-from app.models import Favorite, Listing, Order, Review, SearchLog, User, ViewHistory
+from app.models import Favorite, Listing, Order, Review, SearchLog, User, UserSettings, ViewHistory
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
 from app.schemas import (
@@ -35,9 +35,22 @@ from app.schemas import (
     Paginated,
     SuggestionDto,
 )
-from app.serializers import listing_to_detail, listing_to_service, listing_to_summary
+from app.serializers import (
+    listing_card_image_url,
+    listing_to_detail,
+    listing_to_service,
+    listing_to_summary,
+)
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
+
+
+def _personalized_viewer_id(db: Session, user: User | None) -> str | None:
+    """Return a viewer id only when interest-based personalization is permitted."""
+    if not user:
+        return None
+    privacy = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+    return user.id if not privacy or privacy.personalization else None
 
 
 def _seller_completed_counts(db: Session, listings: list[Listing]) -> dict[str, int]:
@@ -93,7 +106,10 @@ def _summarize_listings(db: Session, items: list[Listing], lang: str) -> list[Li
 
 
 def _user_can_view_inactive_listing(db: Session, listing: Listing, user: User | None) -> bool:
-    if listing.status == "active":
+    seller_is_normal = bool(
+        listing.seller and listing.seller.account_status == "normal"
+    )
+    if listing.status == "active" and seller_is_normal:
         return True
     if user is None:
         return False
@@ -111,6 +127,11 @@ def _user_can_view_inactive_listing(db: Session, listing: Listing, user: User | 
     )
     if has_order:
         return True
+    # Suspension/ban is a server-enforced visibility boundary. Historical
+    # favorites or views must not make that seller's catalog public again;
+    # only the seller and actual transaction participants retain access.
+    if not seller_is_normal:
+        return False
     favorited = (
         db.query(Favorite.id)
         .filter(Favorite.user_id == user.id, Favorite.listing_id == listing.id)
@@ -166,7 +187,11 @@ def get_feed(
     q = apply_tab_filter(q, tab)
     if categoryKey and tab != "services":
         q = q.filter(Listing.category_key == categoryKey)
-    q = apply_feed_sort(q)
+    q = apply_feed_sort(
+        q,
+        viewer_user_id=_personalized_viewer_id(db, user),
+        viewer_city=user.city if user else None,
+    )
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
     return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
@@ -338,7 +363,11 @@ def get_related(
     q = exclude_unpaid_reserved(q, db, viewer_id)
     q = exclude_blocked_sellers(q, db, user.id if user else None)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
-    q = q.order_by(Listing.created_at.desc())
+    q = apply_feed_sort(
+        q,
+        viewer_user_id=_personalized_viewer_id(db, user),
+        viewer_city=user.city if user else None,
+    )
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
     return paginate(_summarize_listings(db, items, lang), page, pageSize, total)
@@ -361,6 +390,12 @@ def get_services(
     q = apply_feed_listing_status_filter(q, db, viewer_id)
     q = exclude_unpaid_reserved(q, db, viewer_id)
     q = apply_region_filter(q, regionState, regionCity, regionArea)
+    q = exclude_blocked_sellers(q, db, user.id if user else None)
+    q = apply_feed_sort(
+        q,
+        viewer_user_id=_personalized_viewer_id(db, user),
+        viewer_city=user.city if user else None,
+    )
     total = q.count()
     items = q.offset((page - 1) * pageSize).limit(pageSize).all()
     return paginate([listing_to_service(i, lang) for i in items], page, pageSize, total)
@@ -392,9 +427,7 @@ def get_suggestions(
         title = listing.title_zh if lang == "zh" and listing.title_zh else listing.title
         words = title.split()
         query = words[0].lower() if words else title[:10].lower()
-        cover = normalize_media_url(listing.image_url)
-        if not cover and listing.images:
-            cover = normalize_media_url(listing.images[0])
+        cover = listing_card_image_url(listing)
         results.append(
             SuggestionDto(
                 query=query,

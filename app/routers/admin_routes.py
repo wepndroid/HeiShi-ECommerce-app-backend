@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from queue import Empty
 from datetime import datetime, timezone
 
@@ -14,22 +15,37 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.admin_audit import log_admin_action
+from app.account_merge import (
+    account_has_cross_domain_state,
+    historical_merge_conflicts,
+    migrate_historical_account_state,
+)
 from app.admin_notifications import (
     notification_payload,
     subscribe_admin_notifications,
     unsubscribe_admin_notifications,
 )
 from app.admin_auth import require_admin
-from app.auth import create_access_token, create_refresh_token, hash_password, normalize_phone, store_refresh_token, verify_password
+from app.auth import (
+    create_access_token,
+    create_refresh_token,
+    hash_password,
+    normalize_phone,
+    store_refresh_token,
+    verify_password,
+)
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.models import (
     AdminNotification,
+    AuthIdentity,
     BlockedKeyword,
     Conversation,
     DailyActiveUser,
+    DeviceSession,
     Favorite,
     Listing,
+    MediaAsset,
     Message,
     Order,
     PlatformBanner,
@@ -41,6 +57,7 @@ from app.models import (
     PromotionClickEvent,
     ReportReason,
     Review,
+    RefreshToken,
     SafetyReport,
     SearchLog,
     User,
@@ -48,7 +65,7 @@ from app.models import (
     ViewHistory,
 )
 from app.media_urls import normalize_media_urls
-from app.notification_jobs import enqueue_notification
+from app.notification_jobs import enqueue_notification, notify_listing_available_again
 from app.payments.refunds import refund_order_payment
 from app.payout_release import release_payout_for_order, reverse_released_payout_for_order
 from app.serializers import user_to_dto, _user_avatar_url
@@ -157,6 +174,11 @@ class AdminLoginRequest(BaseModel):
 
 class AdminNoteRequest(BaseModel):
     note: str
+
+
+class AdminMergeAccountsRequest(BaseModel):
+    sourceUserId: str = Field(min_length=1)
+    destinationUserId: str = Field(min_length=1)
 
 
 class RejectRequest(BaseModel):
@@ -479,9 +501,19 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
 
 
 def _issue_admin_tokens(db: Session, user: User) -> AuthTokensDto:
-    access = create_access_token(user.id)
     refresh = create_refresh_token()
-    store_refresh_token(db, user.id, refresh)
+    refresh_record = store_refresh_token(db, user.id, refresh)
+    session = DeviceSession(
+        user_id=user.id,
+        refresh_token_id=refresh_record.id,
+        device_id=f"admin-web-{secrets.token_urlsafe(18)}",
+        platform="web",
+        device_name="Admin dashboard",
+    )
+    db.add(session)
+    db.flush()
+    access = create_access_token(user.id, session.id)
+    db.commit()
     return AuthTokensDto(
         accessToken=access,
         refreshToken=refresh,
@@ -630,6 +662,232 @@ def set_user_notes(user_id: str, body: AdminNoteRequest, db: Session = Depends(g
     user.admin_notes = body.note
     db.commit()
     return {"ok": True}
+
+
+def _account_has_marketplace_history(db: Session, user_id: str) -> bool:
+    return account_has_cross_domain_state(db, user_id) or any(
+        (
+            db.query(Listing.id).filter(Listing.seller_id == user_id).first(),
+            db.query(Order.id).filter(or_(Order.buyer_id == user_id, Order.seller_id == user_id)).first(),
+            db.query(Conversation.id)
+            .filter(or_(Conversation.buyer_id == user_id, Conversation.seller_id == user_id))
+            .first(),
+        )
+    )
+
+
+def _apply_merged_identity(user: User, identity: AuthIdentity) -> None:
+    try:
+        metadata = json.loads(identity.metadata_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if identity.provider == "phone":
+        user.phone = identity.provider_subject
+        user.phone_verified = identity.verified
+    elif identity.provider == "wechat":
+        user.wechat_openid = metadata.get("openid") or identity.provider_subject
+        user.wechat_unionid = metadata.get("unionid")
+        user.wechat_bound = identity.verified
+    elif identity.provider == "alipay":
+        user.alipay_bound = identity.verified
+    elif identity.provider == "google":
+        user.google_sub = identity.provider_subject
+
+
+def _clear_merged_legacy_identities(user: User) -> None:
+    user.phone = None
+    user.phone_verified = False
+    user.wechat_openid = None
+    user.wechat_unionid = None
+    user.wechat_bound = False
+    user.alipay_bound = False
+    user.google_sub = None
+
+
+def _backfill_merge_identities(db: Session, user: User) -> None:
+    candidates = [
+        ("phone", user.phone, bool(user.phone_verified), {}),
+        (
+            "wechat",
+            user.wechat_unionid or user.wechat_openid,
+            bool(user.wechat_bound),
+            {"openid": user.wechat_openid, "unionid": user.wechat_unionid},
+        ),
+        ("google", user.google_sub, bool(user.email_verified), {"email": user.email}),
+    ]
+    for provider, subject, verified, metadata in candidates:
+        if not subject:
+            continue
+        row = (
+            db.query(AuthIdentity)
+            .filter(AuthIdentity.provider == provider, AuthIdentity.provider_subject == subject)
+            .first()
+        )
+        if row and row.user_id != user.id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "IDENTITY_CONFLICT", "message": f"{provider} identity belongs to another account", "details": {}},
+            )
+        if not row:
+            db.add(
+                AuthIdentity(
+                    user_id=user.id,
+                    provider=provider,
+                    provider_subject=subject,
+                    verified=verified,
+                    metadata_json=json.dumps(metadata),
+                    last_used_at=datetime.now(timezone.utc),
+                )
+            )
+    db.flush()
+
+
+@router.post("/users/merge-accounts")
+def merge_user_accounts(
+    body: AdminMergeAccountsRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Transactionally merge an authorized source account into the keeper account."""
+    if body.sourceUserId == body.destinationUserId:
+        raise HTTPException(status_code=400, detail={"code": "SAME_ACCOUNT", "message": "Choose two different accounts", "details": {}})
+    source = db.query(User).filter(User.id == body.sourceUserId).first()
+    destination = db.query(User).filter(User.id == body.destinationUserId).first()
+    if not source or not destination:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Source or destination user not found", "details": {}})
+    if source.is_admin or destination.is_admin:
+        raise HTTPException(status_code=403, detail={"code": "ADMIN_ACCOUNT", "message": "Administrator accounts cannot be merged", "details": {}})
+    if source.account_status == "merged":
+        raise HTTPException(status_code=409, detail={"code": "ALREADY_MERGED", "message": "Source account was already merged", "details": {}})
+    if source.account_status != "normal" or destination.account_status != "normal":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ACCOUNT_NOT_MERGEABLE",
+                "message": "Only active, normal marketplace accounts can be merged.",
+                "details": {
+                    "sourceStatus": source.account_status,
+                    "destinationStatus": destination.account_status,
+                },
+            },
+        )
+    _backfill_merge_identities(db, source)
+    _backfill_merge_identities(db, destination)
+    source_identities = db.query(AuthIdentity).filter(AuthIdentity.user_id == source.id).all()
+    destination_identities = db.query(AuthIdentity).filter(AuthIdentity.user_id == destination.id).all()
+    by_provider = {row.provider: row for row in destination_identities}
+    for identity in source_identities:
+        existing = by_provider.get(identity.provider)
+        if existing and existing.provider_subject != identity.provider_subject:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "IDENTITY_PROVIDER_CONFLICT",
+                    "message": f"Both accounts have different {identity.provider} identities",
+                    "details": {"provider": identity.provider},
+                },
+            )
+
+    relationship_conflicts = historical_merge_conflicts(
+        db,
+        source_user_id=source.id,
+        destination_user_id=destination.id,
+    )
+    if relationship_conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_COUNTERPART_CONFLICT",
+                "message": (
+                    "These accounts are counterparties in the same marketplace "
+                    "record and cannot be merged without corrupting its audit history."
+                ),
+                "details": {"relationships": relationship_conflicts},
+            },
+        )
+    provider_conflicts = [
+        field
+        for field in ("stripe_connect_id", "stripe_customer_id")
+        if getattr(source, field)
+        and getattr(destination, field)
+        and getattr(source, field) != getattr(destination, field)
+    ]
+    if provider_conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MERGE_PAYMENT_ACCOUNT_CONFLICT",
+                "message": "The accounts contain different payment-provider identities.",
+                "details": {"fields": provider_conflicts},
+            },
+        )
+
+    moved_providers: list[str] = []
+    moved_state = migrate_historical_account_state(
+        db,
+        source_user_id=source.id,
+        destination_user_id=destination.id,
+    )
+    destination.stripe_connect_id = destination.stripe_connect_id or source.stripe_connect_id
+    destination.stripe_customer_id = destination.stripe_customer_id or source.stripe_customer_id
+    destination.identity_verified = destination.identity_verified or source.identity_verified
+    destination.business_verified = destination.business_verified or source.business_verified
+    destination.is_muted = destination.is_muted or source.is_muted
+    destination.muted_at = destination.muted_at or source.muted_at
+    destination.mute_reason = destination.mute_reason or source.mute_reason
+    destination.publish_restricted = (
+        destination.publish_restricted or source.publish_restricted
+    )
+    destination.publish_restricted_at = (
+        destination.publish_restricted_at or source.publish_restricted_at
+    )
+    destination.publish_restrict_reason = (
+        destination.publish_restrict_reason or source.publish_restrict_reason
+    )
+    destination.is_flagged = destination.is_flagged or source.is_flagged
+    destination.flag_reason = destination.flag_reason or source.flag_reason
+    _clear_merged_legacy_identities(source)
+    db.flush()
+    for identity in source_identities:
+        existing = by_provider.get(identity.provider)
+        if existing:
+            existing.verified = existing.verified or identity.verified
+            db.delete(identity)
+            continue
+        identity.user_id = destination.id
+        _apply_merged_identity(destination, identity)
+        moved_providers.append(identity.provider)
+
+    now = datetime.now(timezone.utc)
+    db.query(RefreshToken).filter(RefreshToken.user_id == source.id, RefreshToken.revoked.is_(False)).update(
+        {"revoked": True}, synchronize_session=False
+    )
+    db.query(DeviceSession).filter(DeviceSession.user_id == source.id, DeviceSession.revoked_at.is_(None)).update(
+        {"revoked_at": now}, synchronize_session=False
+    )
+    source.account_status = "merged"
+    source.admin_notes = f"Merged into user {destination.id} by administrator {admin.id}."
+    log_admin_action(
+        db,
+        admin_id=admin.id,
+        action_type="merge_user_accounts",
+        target_type="user",
+        target_id=source.id,
+        before={"sourceUserId": source.id, "destinationUserId": destination.id},
+        after={
+            "movedProviders": moved_providers,
+            "movedState": moved_state,
+            "sourceStatus": "merged",
+        },
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "sourceUserId": source.id,
+        "destinationUserId": destination.id,
+        "movedProviders": moved_providers,
+        "movedState": moved_state,
+    }
 
 
 @router.get("/users/{user_id}")
@@ -810,11 +1068,44 @@ def get_content_detail(listing_id: int, db: Session = Depends(get_db), admin: Us
     return _listing_admin_detail(db, _get_listing_or_404(db, listing_id))
 
 
+def _require_listing_media_approved(db: Session, listing: Listing) -> None:
+    """Prevent a content approval from bypassing the separate media review."""
+    assets = db.query(MediaAsset).filter(MediaAsset.listing_id == listing.id).all()
+    blocked = [
+        asset
+        for asset in assets
+        if asset.status != "READY" or asset.moderation_status != "approved"
+    ]
+    if blocked:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MEDIA_REVIEW_REQUIRED",
+                "message": "Approve every image and video before approving this listing",
+                "details": {
+                    "assetIds": [asset.id for asset in blocked],
+                    "statuses": [
+                        {
+                            "id": asset.id,
+                            "processingStatus": asset.status,
+                            "moderationStatus": asset.moderation_status,
+                        }
+                        for asset in blocked
+                    ],
+                },
+            },
+        )
+
+
 @router.post("/content/{listing_id}/approve")
 def approve_content(listing_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     listing = db.query(Listing).filter(Listing.id == listing_id).first()
     if not listing:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Listing not found", "details": {}})
+    was_publicly_available = (
+        listing.status == "active" and listing.review_status == "approved"
+    )
+    _require_listing_media_approved(db, listing)
     listing.review_status = "approved"
     listing.reviewed_at = datetime.now(timezone.utc)
     listing.reviewed_by = admin.id
@@ -836,6 +1127,12 @@ def approve_content(listing_id: int, db: Session = Depends(get_db), admin: User 
         deduplication_key=f"listing:{listing.id}:review:approved:{listing.reviewed_at.isoformat()}",
         mandatory=True,
     )
+    if not was_publicly_available and listing.status == "active":
+        notify_listing_available_again(
+            db,
+            listing,
+            transition_key=listing.reviewed_at.isoformat(),
+        )
     log_admin_action(db, admin_id=admin.id, action_type="approve_content", target_type="listing", target_id=listing_id)
     db.commit()
     return {"ok": True}
@@ -911,6 +1208,7 @@ def remove_content(
 @router.post("/content/{listing_id}/restore")
 def restore_content(listing_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     listing = _get_listing_or_404(db, listing_id)
+    _require_listing_media_approved(db, listing)
     listing.review_status = "approved"
     listing.status = "active"
     listing.reviewed_at = datetime.now(timezone.utc)

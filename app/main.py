@@ -1,14 +1,17 @@
 from contextlib import asynccontextmanager
 import asyncio
+import json
+import logging
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import settings
+from app.config import settings, validate_runtime_configuration
 from app.database import Base, SessionLocal, engine
 from app.routers import auth, catalog, listings, messages, orders, platform_features, region_safety, user_data, users
 from app.routers import admin_routes
@@ -17,36 +20,39 @@ from app.migrations import run_migrations
 from app.conversation_inbox import cleanup_duplicate_empty_conversations
 from app.messaging_read import backfill_read_watermarks
 from app.seed import seed
+from app.background_jobs import run_periodic_cycle, scheduler_owner_id
+
+
+logger = logging.getLogger(__name__)
+_SCHEDULER_OWNER_ID = scheduler_owner_id()
 
 
 async def _auto_confirm_loop() -> None:
     while True:
-        await asyncio.sleep(3600)
+        # Payment deadlines are measured in minutes, so an hourly worker can
+        # expire an order before either reminder is ever evaluated.
+        await asyncio.sleep(max(settings.background_jobs_interval_seconds, 10))
         db = SessionLocal()
         try:
-            from app.order_jobs import process_auto_confirm_orders
-            from app.notification_jobs import process_scheduled_notifications
-
-            process_auto_confirm_orders(db)
-            process_scheduled_notifications(db)
+            run_periodic_cycle(db, owner_id=_SCHEDULER_OWNER_ID)
+        except Exception:  # noqa: BLE001 - never allow the periodic task to die
+            db.rollback()
+            logger.exception("Unexpected periodic scheduler-cycle failure")
         finally:
             db.close()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    validate_runtime_configuration()
     Base.metadata.create_all(bind=engine)
     run_migrations(engine)
     db = SessionLocal()
     try:
         backfill_read_watermarks(db)
         cleanup_duplicate_empty_conversations(db)
-        from app.order_jobs import process_auto_confirm_orders
-        from app.notification_jobs import process_scheduled_notifications
-
-        process_auto_confirm_orders(db)
-        process_scheduled_notifications(db)
         seed(db)
+        run_periodic_cycle(db, owner_id=_SCHEDULER_OWNER_ID)
     finally:
         db.close()
     task = asyncio.create_task(_auto_confirm_loop())
@@ -139,9 +145,113 @@ async def validation_exception_handler(_request: Request, exc: RequestValidation
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    from app.video_processing import video_processor_available
+
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "capabilities": {
+            "videoProcessing": video_processor_available(),
+            "verifiedAndroidLinks": bool(
+                settings.android_app_sha256_fingerprints.strip()
+            ),
+            "verifiedIosLinks": bool(settings.apple_team_id.strip()),
+        },
+    }
 
 
 @app.get("/v1")
 def v1_root():
     return {"service": "HeyMarket API", "version": "v1", "docs": "/docs"}
+
+
+@app.get("/.well-known/assetlinks.json")
+def android_asset_links():
+    fingerprints = [
+        value.strip()
+        for value in settings.android_app_sha256_fingerprints.split(",")
+        if value.strip()
+    ]
+    if not fingerprints:
+        return JSONResponse(content=[])
+    return JSONResponse(
+        content=[
+            {
+                "relation": ["delegate_permission/common.handle_all_urls"],
+                "target": {
+                    "namespace": "android_app",
+                    "package_name": settings.android_app_package,
+                    "sha256_cert_fingerprints": fingerprints,
+                },
+            }
+        ]
+    )
+
+
+@app.get("/.well-known/apple-app-site-association")
+def apple_app_site_association():
+    app_id = ".".join(
+        value
+        for value in (settings.apple_team_id.strip(), settings.apple_bundle_id.strip())
+        if value
+    )
+    details = [{"appID": app_id, "paths": ["/s/*"]}] if settings.apple_team_id.strip() else []
+    return JSONResponse(
+        content={"applinks": {"apps": [], "details": details}},
+        media_type="application/json",
+    )
+
+
+@app.get("/s/{share_token}", response_class=HTMLResponse)
+def public_share_landing(share_token: str):
+    """Verified-link landing page with an explicit clipboard/install fallback."""
+    safe_token = "".join(
+        character for character in share_token if character.isalnum() or character in "_-"
+    )[:256]
+    if not safe_token or safe_token != share_token:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    deep_link = f"heymarket://shares/{safe_token}"
+    share_text = f"【HeyMarket】{safe_token}"
+    play_store_url = (
+        "https://play.google.com/store/apps/details"
+        f"?id={quote(settings.android_app_package, safe='')}"
+        f"&referrer={quote(f'share_token={safe_token}', safe='')}"
+    )
+    ios_install = (
+        f"""<button type="button" onclick="copyAndInstall({json.dumps(settings.ios_app_store_url)})">
+Install HeyMarket for iPhone</button>"""
+        if settings.ios_app_store_url.strip().startswith("https://")
+        else ""
+    )
+    return HTMLResponse(
+        content=f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport"
+content="width=device-width,initial-scale=1"><title>Open in HeyMarket</title></head>
+<body style="font-family:system-ui;margin:3rem auto;max-width:32rem;padding:1rem">
+<h1>Open this product in HeyMarket</h1>
+<p>If the app does not open, copy the share code, install HeyMarket, and open it again.</p>
+<p><code id="code">{share_text}</code></p>
+<button onclick="navigator.clipboard.writeText(document.getElementById('code').textContent)">
+Copy share code</button>
+<p><a href="{deep_link}">Open HeyMarket</a></p>
+<p><a href="{play_store_url}">Install HeyMarket for Android</a></p>
+{ios_install}
+<script>
+function copyAndInstall(destination) {{
+  var shareCode = document.getElementById('code').textContent;
+  var proceed = function () {{ window.location.assign(destination); }};
+  if (navigator.clipboard && window.isSecureContext) {{
+    navigator.clipboard.writeText(shareCode).then(proceed, proceed);
+  }} else {{
+    proceed();
+  }}
+}}
+window.location.replace({json.dumps(deep_link)});
+if (/Android/i.test(navigator.userAgent)) {{
+  window.setTimeout(function () {{
+    if (!document.hidden) window.location.replace({json.dumps(play_store_url)});
+  }}, 1500);
+}}
+</script>
+</body></html>"""
+    )

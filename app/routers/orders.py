@@ -23,9 +23,9 @@ from app.catalog_helpers import (
 from app.config import settings
 from app.coupon_service import refresh_expired_coupons
 from app.database import SessionLocal, get_db
-from app.models import Coupon, Listing, Order, Review, User
+from app.models import Coupon, Listing, Order, PrivateOffer, Review, User
 from app.order_jobs import schedule_auto_confirm
-from app.notification_jobs import enqueue_notification
+from app.notification_jobs import enqueue_notification, notify_seller_new_order
 from app.payments.fulfillment import dispatch_order_paid_push, fulfill_paid_order
 from app.pagination import paginate
 from app.platform_config import escrow_fee_from_db
@@ -160,6 +160,17 @@ def _conflicting_open_order(
             return order
         if order.bundle_item_id == bundle_item_id:
             return order
+    private_reservation = (
+        db.query(Order)
+        .filter(
+            Order.listing_id == listing_id,
+            Order.status == "pendingPay",
+            Order.private_offer_id.is_not(None),
+        )
+        .first()
+    )
+    if private_reservation:
+        return private_reservation
     return None
 
 
@@ -357,6 +368,8 @@ def create_order(
     )
     _set_display_amount_cny(order)
     db.add(order)
+    db.flush()
+    notify_seller_new_order(db, order, listing.title)
     db.commit()
     db.refresh(order)
     order.listing = listing
@@ -385,19 +398,59 @@ def update_order(
     patch = body.model_dump(exclude_unset=True)
     listing = db.query(Listing).filter(Listing.id == order.listing_id).first()
     if listing:
-        if order.bundle_item_id:
+        if order.private_offer_id:
+            offer = (
+                db.query(PrivateOffer)
+                .filter(
+                    PrivateOffer.id == order.private_offer_id,
+                    PrivateOffer.order_id == order.id,
+                    PrivateOffer.buyer_id == user.id,
+                )
+                .first()
+            )
+            if not offer:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PRIVATE_OFFER_INVALID",
+                        "message": "The private offer for this order is no longer valid",
+                        "details": {},
+                    },
+                )
+            if "couponId" in patch and patch["couponId"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "COUPON_NOT_ALLOWED",
+                        "message": "Coupons cannot be combined with a private offer",
+                        "details": {},
+                    },
+                )
+            order.amount = round(float(offer.total_amount), 2)
+            order.discount_amount = 0.0
+            order.coupon_id = None
+            order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
+        elif order.bundle_item_id:
             item = find_bundle_item(listing, order.bundle_item_id)
             base = bundle_item_separate_price(item) if item else order.amount + order.discount_amount
+            order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
+            coupon_id = patch["couponId"] if "couponId" in patch else order.coupon_id
+            payable, discount, resolved_coupon = _apply_coupon(
+                db, user.id, coupon_id, base, exclude_order_id=order.id
+            )
+            order.amount = payable
+            order.discount_amount = discount
+            order.coupon_id = resolved_coupon
         else:
             base = listing_checkout_amount(listing)
-        order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
-        coupon_id = patch["couponId"] if "couponId" in patch else order.coupon_id
-        payable, discount, resolved_coupon = _apply_coupon(
-            db, user.id, coupon_id, base, exclude_order_id=order.id
-        )
-        order.amount = payable
-        order.discount_amount = discount
-        order.coupon_id = resolved_coupon
+            order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
+            coupon_id = patch["couponId"] if "couponId" in patch else order.coupon_id
+            payable, discount, resolved_coupon = _apply_coupon(
+                db, user.id, coupon_id, base, exclude_order_id=order.id
+            )
+            order.amount = payable
+            order.discount_amount = discount
+            order.coupon_id = resolved_coupon
     order.updated_at = datetime.now(timezone.utc)
     _set_display_amount_cny(order)
     db.commit()
@@ -422,6 +475,15 @@ def seller_adjust_amount(
         raise HTTPException(
             status_code=400,
             detail={"code": "INVALID_STATE", "message": "Only unpaid orders can be repriced", "details": {}},
+        )
+    if order.private_offer_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PRIVATE_OFFER_PRICE_LOCKED",
+                "message": "An accepted private offer cannot be repriced",
+                "details": {},
+            },
         )
     order.amount = round(body.amount, 2)
     _set_display_amount_cny(order)
@@ -450,29 +512,29 @@ def pay_order(
             status_code=400,
             detail={"code": "PAYMENT_PENDING", "message": "Payment has not been confirmed yet", "details": {}},
         )
-    listing = (
-        db.query(Listing)
-        .filter(Listing.id == order.listing_id)
-        .with_for_update()
-        .first()
-    )
-    if listing:
-        if order.bundle_item_id:
-            item = find_bundle_item(listing, order.bundle_item_id)
-            expected = bundle_item_separate_price(item) if item else 0.0
-        else:
-            expected = listing_checkout_amount(listing)
-        if expected <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "INVALID_STATE", "message": "Listing is no longer available for purchase", "details": {}},
+    if order.private_offer_id:
+        offer = (
+            db.query(PrivateOffer)
+            .filter(
+                PrivateOffer.id == order.private_offer_id,
+                PrivateOffer.order_id == order.id,
+                PrivateOffer.buyer_id == user.id,
+                PrivateOffer.status == "CONVERTED_TO_ORDER",
             )
-        payable, discount, _ = _apply_coupon(
-            db, user.id, order.coupon_id, expected, exclude_order_id=order.id
+            .first()
         )
-        order.amount = payable
-        order.discount_amount = discount
-        order.escrow_fee = escrow_fee_from_db(db) if listing.escrow_supported else 0.0
+        if not offer:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PRIVATE_OFFER_INVALID",
+                    "message": "The private offer for this order is no longer valid",
+                    "details": {},
+                },
+            )
+    # Never recalculate the amount after the PSP has confirmed payment. The order
+    # amount is the immutable amount authorized at checkout; fulfillment performs
+    # the final locked inventory check and compensates a lost race with a refund.
     fulfill_paid_order(db, order)
     db.refresh(order)
     paid_order = (
@@ -481,7 +543,11 @@ def pay_order(
         .filter(Order.id == order_id)
         .first()
     )
-    if paid_order and paid_order.listing:
+    if (
+        paid_order
+        and paid_order.listing
+        and paid_order.status in {"pendingShip", "pendingService"}
+    ):
         buyer_name = paid_order.buyer.nickname if paid_order.buyer else "Buyer"
         background_tasks.add_task(
             _dispatch_order_paid_push,
@@ -893,6 +959,26 @@ def _maybe_complete_order_after_review(db: Session, order: Order) -> None:
     order.status = "completed"
     release_payout_for_order(db, order)
     order.updated_at = datetime.now(timezone.utc)
+    for user_id, role in (
+        (order.buyer_id, "buyer"),
+        (order.seller_id, "seller"),
+    ):
+        enqueue_notification(
+            db,
+            user_id=user_id,
+            role=role,
+            category="order_update",
+            notification_type="order_completed",
+            title="Order completed",
+            body=f"Order #{order.id} is complete.",
+            title_zh="订单已完成",
+            body_zh=f"订单 #{order.id} 已完成。",
+            business_type="order",
+            business_id=str(order.id),
+            deep_link=f"heymarket://order/{order.id}",
+            deduplication_key=f"order:{order.id}:completed:{role}",
+            mandatory=True,
+        )
     listing = db.query(Listing).filter(Listing.id == order.listing_id).first()
     if listing and listing.status != "sold":
         listing.status = "sold"

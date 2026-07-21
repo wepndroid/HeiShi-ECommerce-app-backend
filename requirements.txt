@@ -6,7 +6,10 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.20
 pydantic-settings==2.7.0
-bcrypt==4.2.1
+# passlib 1.7.4 reads bcrypt.__about__, which was removed in bcrypt 4.1.
+# Pin the compatible release so authentication does not emit a trapped backend
+# warning on every fresh deployment.
+bcrypt==4.0.1
 Pillow==11.1.0
 httpx==0.28.1
 stripe==11.4.0
